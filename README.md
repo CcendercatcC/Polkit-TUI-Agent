@@ -97,7 +97,7 @@ Type=simple
 # --uid-session: register to the uid's graphical session, so auth requests from
 # SSH-attached tmux panes / desktop processes are served (the behavior of a
 # desktop polkit agent); drop it if you only use the local desktop session
-ExecStart=/home/EMeowSystem/Documents/Rust/polkit-tui-agent/target/release/polkit-tui-agent --daemon --uid-session
+ExecStart=%h/polkit-tui-agent/target/release/polkit-tui-agent --daemon --uid-session
 Restart=on-failure
 
 [Install]

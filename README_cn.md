@@ -78,7 +78,7 @@ After=dbus.service
 Type=simple
 # --uid-session：注册到 uid 图形会话，服务 SSH attach 的 tmux 窗格/桌面进程
 # 发起的认证请求（桌面 polkit agent 的行为）；若只在本地桌面会话内使用可去掉
-ExecStart=/home/EMeowSystem/Documents/Rust/polkit-tui-agent/target/release/polkit-tui-agent --daemon --uid-session
+ExecStart=%h/polkit-tui-agent/target/release/polkit-tui-agent --daemon --uid-session
 Restart=on-failure
 
 [Install]

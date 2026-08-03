@@ -1,43 +1,50 @@
-# polkit-tui-agent 程序内架构
+# polkit-tui-agent internal architecture
 
-本文档描述**本程序内部**的架构：模块之间的依赖、进程与任务怎么组成、数据
-怎么流、并发与同步点、超时与安全边界。不涉及 polkit 协议本身的细节（那部分
-见 AGENTS.md）。面向要改代码的开发者；阅读前提是先对四种运行形态有印象
-（见 README.md）。
+> 中文版本: [ARCHITECTURE_cn.md](ARCHITECTURE_cn.md)
 
-## 1. 总览
+This document describes the architecture **inside this program**: module
+dependencies, how processes and tasks are composed, how data flows, the
+concurrency and synchronization points, and the timeout and security
+boundaries. It does not cover details of the polkit protocol itself (that part
+is in AGENTS.md). It targets developers modifying the code.
 
-单个 Rust binary（`src/main.rs` 一个 crate），10 个模块，零外部二进制依赖
-（只调 `tmux` 与系统 `polkit-agent-helper-1`）。程序没有"库 crate 加多个
-二进制"的划分——**所有模块都被 `main.rs` 以 `mod` 声明进同一个 crate**，
-各运行形态靠 `main` 按命令行旗标分派，复用同一批组件。
+## 1. Overview
 
-五种运行形态（四种用户可见 + 一个内部）：
+A single Rust binary (`src/main.rs`, one crate) with 10 modules and zero
+external binary dependencies (it only invokes `tmux` and the system
+`polkit-agent-helper-1`). There is no "library crate plus multiple binaries"
+split — **all modules are declared into the same crate via `mod` in
+`main.rs`**, and each run mode is dispatched by `main` based on command-line
+flags, reusing the same set of components.
 
-| 形态 | 旗标 | 进程数 | 组件装配 |
+Five run modes (four user-visible + one internal):
+
+| Mode | Flag | Processes | Assembly |
 |---|---|---|---|
-| inline TUI | （默认） | 1 | `Agent::inline` + `run_tui` 事件循环 |
-| 后台 daemon | `--daemon` | 1 | `Agent::daemon` + `Daemon::start` + socket 服务端 |
-| tmux 控制器 | `--controller` | 1（独立） | `controller::run`，连 daemon 的 socket |
-| tmux 一体 | `--tmux` | 1 | daemon 组件 + controller 任务自连，同一进程 |
-| 弹窗（内部） | `--prompt` | 1（短命） | 事件循环 + helper 认证，由 controller 拉起 |
+| inline TUI | (default) | 1 | `Agent::inline` + `run_tui` event loop |
+| Background daemon | `--daemon` | 1 | `Agent::daemon` + `Daemon::start` + socket server |
+| tmux controller | `--controller` | 1 (standalone) | `controller::run`, connects to the daemon's socket |
+| tmux all-in-one | `--tmux` | 1 | daemon components + controller task self-connecting, same process |
+| Popup (internal) | `--prompt` | 1 (short-lived) | event loop + helper auth, spawned by the controller |
 
-关键洞察：**`--tmux` 就是 `--daemon` 加一个 `controller::run` 任务**；
-`--prompt` 是唯一"自带完整认证循环"的进程，其它形态要么借 UI 事件循环
-（inline）要么借弹窗进程（daemon/controller）来完成收密码。
+Key insight: **`--tmux` is `--daemon` plus a `controller::run` task**;
+`--prompt` is the only process that carries its own complete auth loop — every
+other mode either borrows the UI event loop (inline) or the popup process
+(daemon/controller) to collect the password.
 
-## 2. 模块依赖
+## 2. Module dependencies
 
-编译期依赖（`mod` 引用）用文字描述：`main` 声明全部 10 个模块；`agent` 依赖
-`daemon`/`helper`/`protocol`/`ui`；`daemon`、`controller` 依赖 `protocol`；
-`prompt` 依赖 `helper`/`ui`/`tui`；`tui` 依赖 `logging`。`helper`/`protocol`/
-`ui`/`logging` 不依赖任何 crate 内模块（`ui` 用 `tokio::sync::oneshot`，
-`logging` 用 `crossterm`/`unicode-width`）。
+Compile-time dependencies (`mod` references) in prose: `main` declares all 10
+modules; `agent` depends on `daemon`/`helper`/`protocol`/`ui`; `daemon` and
+`controller` depend on `protocol`; `prompt` depends on `helper`/`ui`/`tui`;
+`tui` depends on `logging`. `helper`/`protocol`/`ui`/`logging` depend on no
+crate-internal module (`ui` uses `tokio::sync::oneshot`, `logging` uses
+`crossterm`/`unicode-width`).
 
 ```
             ┌──────────────────────────────────────────┐
             │                 main.rs                  │
-            │  分派 / 参数 / session 解析 / run_tui     │
+            │   dispatch / args / session / run_tui    │
             └───┬─────┬──────┬──────┬──────┬───────────┘
                 ▼     ▼      ▼      ▼      ▼
              agent  daemon controller prompt  tui
@@ -46,260 +53,281 @@
                │          ▼           │   logging
                │        protocol      │
                │          ▲           │
-               ├───────► helper ◄─────┤   （prompt 另依赖 tui，
-               └───────► ui ◄─────────┘     agent 依赖 protocol/helper/ui）
+               ├───────► helper ◄─────┤   (prompt also depends on tui,
+               └───────► ui ◄─────────┘     agent depends on protocol/helper/ui)
 ```
 
-箭头表示 `use` 依赖方向。运行期协作见下表：
+Arrows show the `use` dependency direction. Runtime collaboration:
 
-| 提供方 | 消费方 | 协作内容 |
+| Provider | Consumer | Collaboration |
 |---|---|---|
-| `agent::Agent` | `main` | 导出为 D-Bus 对象（`object_server().at(OBJECT_PATH, ...)`） |
-| `agent` | `ui` | 经 `mpsc<UiEvent>` 推送认证事件；`UiEvent::Prompt` 携带 `oneshot::Sender` |
-| `ui` | `agent` | 经 oneshot 回传 `PromptAnswer`（Submit/Cancel） |
-| `agent` | `helper` | `HelperSession`：socket/二进制双路径连 root helper，行协议应答 |
-| `agent` | `daemon` | `daemon.request(AuthRequest) -> AuthResult`、`daemon.cancel(cookie)` |
-| `daemon` | `controller` | socket NDJSON：`ServerMsg`（Request/Cancel）/ `ClientMsg`（Response） |
-| `controller` | `prompt` | 经 `tmux display-popup -E` + `POLKIT_*` 环境变量拉起 `--prompt` |
-| `main`/`prompt` | `tui` | `Tui::open` 拿 `/dev/tty` 终端句柄，`Terminal::draw` 渲染 |
-| `main`/`prompt` | `ui` | `App` 状态机 + `render`/`render_full` |
-| `main`/`daemon`/`tui` | `logging` | `log_line`（stdout）/`error_line`（stderr）/`set_tui_active` |
+| `agent::Agent` | `main` | Exported as a D-Bus object (`object_server().at(OBJECT_PATH, ...)`) |
+| `agent` | `ui` | Pushes auth events via `mpsc<UiEvent>`; `UiEvent::Prompt` carries an `oneshot::Sender` |
+| `ui` | `agent` | Returns `PromptAnswer` (Submit/Cancel) over the oneshot |
+| `agent` | `helper` | `HelperSession`: dual socket/binary paths to the root helper, line-protocol responses |
+| `agent` | `daemon` | `daemon.request(AuthRequest) -> AuthResult`, `daemon.cancel(cookie)` |
+| `daemon` | `controller` | socket NDJSON: `ServerMsg` (Request/Cancel) / `ClientMsg` (Response) |
+| `controller` | `prompt` | Spawns `--prompt` via `tmux display-popup -E` + `POLKIT_*` env vars |
+| `main`/`prompt` | `tui` | `Tui::open` obtains the `/dev/tty` handle, `Terminal::draw` renders |
+| `main`/`prompt` | `ui` | `App` state machine + `render`/`render_full` |
+| `main`/`daemon`/`tui` | `logging` | `log_line` (stdout) / `error_line` (stderr) / `set_tui_active` |
 
-## 3. 进程与任务装配
+## 3. Process and task assembly
 
-### 3.1 inline（默认）
+### 3.1 inline (default)
 
-一个进程，两类并发工作：
+One process, two kinds of concurrent work:
 
-- **zbus D-Bus 派发**：`Connection::system()` + 把 `Agent::inline` 挂到
-  `OBJECT_PATH`。zbus 开着 `tokio` feature，接口方法（`begin_authentication`
-  等）跑在 `#[tokio::main]` 的运行时上；`begin_authentication` 阻塞等待认证，
-  `cancel_authentication` 并发插入。
-- **`run_tui` 事件循环**（main.rs）：一个 `tokio::select!` 同时等三路——
-  crossterm `EventStream`（键盘）、`mpsc<UiEvent>`（agent 推送）、100ms tick
-  （周期性重绘）。每次 select 结束统一 `terminal.draw` 一帧。
+- **zbus D-Bus dispatch**: `Connection::system()` + mounting `Agent::inline` at
+  `OBJECT_PATH`. zbus runs with the `tokio` feature, so interface methods
+  (`begin_authentication` etc.) run on the `#[tokio::main]` runtime;
+  `begin_authentication` blocks awaiting auth while `cancel_authentication`
+  interleaves concurrently.
+- **`run_tui` event loop** (main.rs): a single `tokio::select!` waits on three
+  sources — the crossterm `EventStream` (keyboard), `mpsc<UiEvent>` (agent
+  pushes), and a 100ms tick (periodic redraw). Each select iteration finishes
+  with one `terminal.draw` frame.
 
-两路认证事件经 `mpsc<UiEvent>` + `oneshot<PromptAnswer>` 桥接，键盘活动经
-`watch<Instant>` 回流供空闲超时判定；TUI 输出走 `/dev/tty`（`tui.rs`），
-`ui_tx` 由 `run_tui` 持有一份，防止通道因发送端全部 drop 而关闭。并发认证
-请求由 agent 的 `slot: Semaphore(1)` FIFO 串行，同一时刻只弹一个对话框。
+The two auth event paths are bridged via `mpsc<UiEvent>` +
+`oneshot<PromptAnswer>`; keyboard activity flows back through `watch<Instant>`
+for idle-timeout detection. TUI output goes to `/dev/tty` (`tui.rs`); `run_tui`
+keeps its own `ui_tx` so the channel is never closed because all senders were
+dropped. Concurrent auth requests are FIFO-serialized by the agent's
+`slot: Semaphore(1)`, so only one dialog shows at a time.
 
-### 3.2 后台 daemon（`--daemon`）
+### 3.2 Background daemon (`--daemon`)
 
-headless，无任何 TUI。任务拓扑：
+Headless, no TUI at all. Task topology:
 
-- 主流程：注册 agent（`Agent::daemon`）→ `Daemon::start` → `object_server().at`
-  → `std::future::pending::<()>()` 常驻。
-- `Daemon::start` 绑定 socket 后 spawn 一个 `accept_loop`。
-- `accept_loop` 每接一个连接 spawn 一个 `handle_connection`。
-- 每个 `handle_connection`：校验对端 uid → 注册为「当前 controller」→ spawn
-  一个写任务（把 `ServerMsg` 从 mpsc 写成 NDJSON 行）→ 本任务循环读 `ClientMsg`。
+- Main flow: register the agent (`Agent::daemon`) → `Daemon::start` →
+  `object_server().at` → `std::future::pending::<()>()` to stay resident.
+- `Daemon::start` binds the socket, then spawns an `accept_loop`.
+- `accept_loop` spawns a `handle_connection` per accepted connection.
+- Each `handle_connection`: validates the peer uid → registers itself as the
+  "current controller" → spawns a writer task (serializing `ServerMsg` from an
+  mpsc into NDJSON lines) → this task loops reading `ClientMsg`.
 
-daemon 自己不做任何密码收集，`begin_authentication` 把 `AuthRequest` 交给
-`daemon.request` 后阻塞，等 controller 回报。并发认证在 agent 层排队
-（`slot: Semaphore(1)`），同一时刻只向 controller 发一个请求，controller 的
-单弹窗不被顶掉。
+The daemon never collects a password itself; `begin_authentication` hands the
+`AuthRequest` to `daemon.request` and blocks until the controller reports back.
+Concurrent auth is queued at the agent layer (`slot: Semaphore(1)`), so only one
+request reaches the controller at a time and its single popup is never
+clobbered.
 
-### 3.3 tmux 控制器（`--controller`）
+### 3.3 tmux controller (`--controller`)
 
-独立进程，运行在 tmux 会话内。`run` 永不返回（除非异常）：外层循环
-`connect_with_retry` 连 daemon socket，连上后：
+A standalone process running inside a tmux session. `run` never returns (except
+on error): the outer loop `connect_with_retry` connects to the daemon socket,
+then:
 
-- spawn `write_loop` 任务（`ClientMsg` → socket）。
-- 读循环解析 `ServerMsg`：`Request` 时 spawn 一个 `run_popup` 任务（弹窗期间
-  读循环不被阻塞，`Cancel` 能及时处理）；`Cancel` 时按 cookie 关闭弹窗并记入
-  `cancelled` 集合（防「取消先到、弹窗请求后到」竞态）。
-- 断线后 `write_task.abort()`，回到外层循环重连。
+- spawns a `write_loop` task (`ClientMsg` → socket).
+- The read loop parses `ServerMsg`: on `Request` it spawns a `run_popup` task
+  (so the read loop is not blocked while a popup is open and `Cancel` is handled
+  promptly); on `Cancel` it closes the popup by cookie and records it in the
+  `cancelled` set (guarding against the "cancel arrives before the popup
+  request" race).
+- On disconnect, `write_task.abort()` and the outer loop reconnects.
 
-每个弹窗由 `run_popup` 用 `tmux display-popup -E` 起一个 `--prompt` 子进程，
-等它退出后把退出码映射成 `AuthResult` 经 mpsc→`write_loop`→socket 回报。
+Each popup is started by `run_popup` via `tmux display-popup -E` running a
+`--prompt` child process; when it exits, the exit code is mapped to an
+`AuthResult` and reported through mpsc → `write_loop` → socket.
 
-### 3.4 tmux 一体（`--tmux`）
+### 3.4 tmux all-in-one (`--tmux`)
 
-即 3.2 与 3.3 合并在一个进程：`tmux_main` 先做 daemon 的全部初始化，然后
-`tokio::spawn(controller::run(socket))` 让 controller **自连自己进程起的
-socket**。内嵌 controller 任务与远程 controller 行为完全一致，只是对端是本
-进程的 daemon。`--tmux` 是用户推荐用法，但对实现而言没有引入任何新逻辑。
+Sections 3.2 and 3.3 merged into one process: `tmux_main` does all the daemon
+initialization first, then `tokio::spawn(controller::run(socket))` lets the
+controller **self-connect to the socket started by its own process**. The
+embedded controller task behaves exactly like a remote controller, except its
+peer is this process's daemon. `--tmux` is the recommended user-facing mode but
+introduces no new logic to the implementation.
 
-### 3.5 弹窗进程（`--prompt`）
+### 3.5 Popup process (`--prompt`)
 
-由 controller 在 `display-popup` 内启动的短命进程，自包含一次认证。任务：
+A short-lived process started by the controller inside `display-popup`,
+self-contained for a single auth. Tasks:
 
-- 主事件循环（`select!` 四路）：键盘、`mpsc<Outcome>`（后台认证任务回报）、
-  `watch<bool>`（取消文件）、100ms tick。
-- 每提交一次密码 spawn 一个 `authenticate_once` 任务连 helper 做 PAM 认证，
-  结果经 `Outcome` 送回主循环（成功 break 0、失败 `app.retry` 回编辑态）。
-- 若设置了 `POLKIT_CANCEL_FILE`，额外 spawn 一个 200ms 轮询任务，发现文件即
-  置位取消 watch。
+- Main event loop (`select!` on four sources): keyboard, `mpsc<Outcome>`
+  (background auth task reports), `watch<bool>` (cancel file), 100ms tick.
+- Each password submission spawns an `authenticate_once` task that connects to
+  the helper for PAM auth; the result returns via `Outcome` to the main loop
+  (success → `break 0`, failure → `app.retry` back to editing).
+- If `POLKIT_CANCEL_FILE` is set, an extra 200ms polling task is spawned that
+  sets the cancel watch when the file appears.
 
-## 4. 模块内部结构
+## 4. Module internals
 
-### 4.1 `main.rs`（入口 + 装配 + inline 事件循环）
+### 4.1 `main.rs` (entry + assembly + inline event loop)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `OBJECT_PATH` | `/org/EMeow/PolicyKit1/AuthenticationAgent`，注册时传给 polkitd 的 object path |
-| `Options` | `locale`（默认 `$LANG`）、`uid_session` |
-| 分派 | `main` 依次查 `--prompt`/`--controller`/`--daemon`/`--tmux`，默认 inline；`-h/--help` 全程优先 |
-| `inline_main` | 检查控制终端 → 连 system bus → 建 `mpsc<UiEvent>` → 挂 Agent → `build_subject` → `register` → `run_tui` → 退出后注销 agent |
-| `tmux_main`/`daemon_main` | 注册 + `Daemon::start` + 挂 Agent + `pending()` 常驻；`--tmux` 额外 spawn controller 自连 |
-| `run_tui` | 三路 `select!`；空对话框时才允许 `q`/Ctrl-C 退出；`needs_full_redraw` 用「空帧+正常帧」两段 draw |
-| `send_answer` | 从 `app.active` 的 `reply` 字段 `take()` 出 oneshot，发 `PromptAnswer` |
-| `build_subject` | `--uid-session` 时 `find_uid_display_session`，否则 `find_session_id` |
-| session 解析 | `find_session_id` = 直属 session（`GetSessionByPID`）→ uid 图形会话（`GetUser.Display`，`(so)` 结构体）→ `XDG_SESSION_ID` 兜底 |
-| `register` | `RegisterAuthenticationAgent`，日志打印实际 session-id 供核对 |
-| `log_cookie` | 日志里的 cookie 表示：默认 FNV-1a 哈希（`fnv1a_hex`，能区分同一 agent 下不同请求）；`--full-cookie-log` 时打印完整值；哈希有全局缓存 |
+| `OBJECT_PATH` | `/org/EMeow/PolicyKit1/AuthenticationAgent`, object path passed to polkitd on registration |
+| `Options` | `locale` (default `$LANG`), `uid_session` |
+| Dispatch | `main` checks `--prompt`/`--controller`/`--daemon`/`--tmux` in order, inline by default; `-h/--help` wins throughout |
+| `inline_main` | check controlling terminal → connect system bus → create `mpsc<UiEvent>` → mount Agent → `build_subject` → `register` → `run_tui` → unregister on exit |
+| `tmux_main`/`daemon_main` | register + `Daemon::start` + mount Agent + `pending()` resident; `--tmux` additionally spawns a self-connecting controller |
+| `run_tui` | three-way `select!`; only allows `q`/Ctrl-C exit when no dialog is open; `needs_full_redraw` uses a two-phase "empty frame + normal frame" draw |
+| `send_answer` | `take()`s the oneshot out of `app.active`'s `reply` field and sends `PromptAnswer` |
+| `build_subject` | `find_uid_display_session` when `--uid-session`, otherwise `find_session_id` |
+| Session resolution | `find_session_id` = own session (`GetSessionByPID`) → uid graphical session (`GetUser.Display`, `(so)` struct) → `XDG_SESSION_ID` fallback |
+| `register` | `RegisterAuthenticationAgent`, logs the actual session-id for verification |
+| `log_cookie` | cookie representation in logs: FNV-1a hash by default (`fnv1a_hex`, distinguishes requests under one agent); full value with `--full-cookie-log`; hashes have a global cache |
 
-### 4.2 `agent.rs`（D-Bus 接口 + 认证状态机）
+### 4.2 `agent.rs` (D-Bus interface + auth state machine)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `PolkitError` | `#[zbus(prefix="org.freedesktop.PolicyKit1.Error")]`，`Cancelled`/`Failed` 两个 D-Bus 错误名 |
-| `Backend` | `Inline { events, activity }` / `Daemon { daemon: Arc<Daemon> }`，决定密码在哪收集；`activity` 是键盘活动回流通道 |
-| `Agent` | `backend` + `pending: Mutex<HashMap<String, watch::Sender<bool>>>`（cookie→取消令牌）+ `slot: Semaphore`（容量 1，并发认证 FIFO 串行） |
-| `begin_authentication` | 选用户名 → 注册取消令牌 → `select!`（排队中取消 / 获取 slot）→ 按后端分发；结束清理令牌表并释放名额 |
-| `cancel_authentication` | 置位 watch + 按后端发 `UiEvent::Cancel` 或 `daemon.cancel` |
-| `authenticate_inline` | 认证主循环：发 Prompt → `select!`（取消/答复/超时/键盘活动刷新）→ 连 helper → PAM 行协议循环 → SUCCESS/Dismiss 或失败重试 |
-| `pick_username` | 候选 identity 偏好：当前用户 → root → 第一个候选；`unix-group` 跳过 |
-| `identity_uid` | 手动解析 `(String, HashMap<String, OwnedValue>)`，取 `unix-user` 的 uid |
+| `PolkitError` | `#[zbus(prefix="org.freedesktop.PolicyKit1.Error")]`, two D-Bus error names: `Cancelled`/`Failed` |
+| `Backend` | `Inline { events, activity }` / `Daemon { daemon: Arc<Daemon> }`, decides where the password is collected; `activity` is the keyboard-activity feedback channel |
+| `Agent` | `backend` + `pending: Mutex<HashMap<String, watch::Sender<bool>>>` (cookie→cancel token) + `slot: Semaphore` (capacity 1, FIFO-serializes concurrent auth) |
+| `begin_authentication` | pick username → register cancel token → `select!` (cancel while queued / acquire slot) → dispatch by backend; cleans up the token table and releases the slot on exit |
+| `cancel_authentication` | set the watch + dispatch `UiEvent::Cancel` (inline) or `daemon.cancel` (daemon) by backend |
+| `authenticate_inline` | auth main loop: send Prompt → `select!` (cancel/reply/timeout/keyboard activity refresh) → connect helper → PAM line-protocol loop → SUCCESS/Dismiss or retry on failure |
+| `pick_username` | identity preference: current user → root → first candidate; `unix-group` skipped |
+| `identity_uid` | manually parses `(String, HashMap<String, OwnedValue>)`, takes the `unix-user` uid |
 
-### 4.3 `daemon.rs`（socket 服务端）
+### 4.3 `daemon.rs` (socket server)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `Daemon` | `pending: Arc<Mutex<HashMap<u64, oneshot::Sender<AuthResult>>>>`（请求 id→应答）、`active: Arc<Mutex<ActiveController>>`、`conn_seq`（generation）、`next_id` |
-| `ActiveController` | `Option<(u64, mpsc::Sender<ServerMsg>)>`，同一时间只认一个当前 controller |
-| `PendingGuard` | Drop 时移除 pending 表项，保证请求被放弃/超时后表不泄漏 |
-| `start` | 清残留 socket（可连上则报"another daemon"）、bind、spawn `accept_loop` |
-| `request` | 分配 id → 插表 → 取当前 controller → 发 `ServerMsg::Request` → 120s 超时等应答；超时主动 `cancel` |
-| `cancel` | 按 cookie 发 `ServerMsg::Cancel` |
-| `accept_loop` | 每连接 spawn `handle_connection` |
-| `handle_connection` | peer_cred 校验 uid → generation 递增并覆盖 active → spawn 写任务 → 读循环（`ClientMsg::Response` 唤醒对应请求）→ 断开时仅当仍是当前 generation 才清 active，并 drain `pending` 全部判 Failed（不等 120s 超时） |
+| `Daemon` | `pending: Arc<Mutex<HashMap<u64, oneshot::Sender<AuthResult>>>>` (request id→reply), `active: Arc<Mutex<ActiveController>>`, `conn_seq` (generation), `next_id` |
+| `ActiveController` | `Option<(u64, mpsc::Sender<ServerMsg>)>`, only one current controller at a time |
+| `PendingGuard` | removes the pending entry on Drop, so the table never leaks after a request is abandoned/timed out |
+| `start` | clears a stale socket (if connectable, reports "another daemon"), binds, spawns `accept_loop` |
+| `request` | allocates an id → inserts into the table → takes the current controller → sends `ServerMsg::Request` → waits up to 120s for a reply; on timeout actively `cancel`s |
+| `cancel` | sends `ServerMsg::Cancel` by cookie |
+| `accept_loop` | spawns `handle_connection` per connection |
+| `handle_connection` | peer_cred uid check → bumps generation and overwrites active → spawns writer task → read loop (`ClientMsg::Response` wakes the matching request) → on disconnect clears active only if still the current generation, and drains all `pending` as Failed (no 120s wait) |
 
-### 4.4 `controller.rs`（tmux 桥）
+### 4.4 `controller.rs` (tmux bridge)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `run` | 外层重连循环 + 读循环；`current: Arc<Mutex<Option<String>>>` 记录当前弹窗 cookie、`cancelled: Arc<Mutex<HashSet<String>>>` 记录已取消 cookie（防「取消先到、弹窗请求后到」竞态） |
-| `connect_with_retry` | 2s 间隔重连，daemon 未起时持续等待 |
-| `write_loop` | 把 `ClientMsg` 序列化为 NDJSON 行写 socket |
-| `run_popup` | `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_* <exe> --prompt`；退出码 0→Ok / 2→Cancel / 其他→Failed |
-| `cancel_file_path` | `$XDG_RUNTIME_DIR/polkit-tui-cancel-<FNV-1a hash>`，cookie 含非文件名安全符号时用 hash 派生 |
+| `run` | outer reconnect loop + read loop; `current: Arc<Mutex<Option<String>>>` tracks the popup's cookie, `cancelled: Arc<Mutex<HashSet<String>>>` records cancelled cookies (guard against "cancel before popup request" race) |
+| `connect_with_retry` | reconnects every 2s, keeps waiting while the daemon is down |
+| `write_loop` | serializes `ClientMsg` into NDJSON lines written to the socket |
+| `run_popup` | `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_* <exe> --prompt`; exit code 0→Ok / 2→Cancel / other→Failed |
+| `cancel_file_path` | `$XDG_RUNTIME_DIR/polkit-tui-cancel-<FNV-1a hash>`, hash-derived when the cookie contains characters unsafe in filenames |
 
-`Request` 处理不阻塞读循环：先记录 current cookie，spawn `run_popup` 任务，
-弹窗结束清理取消文件与 current 标记后回报。`Cancel` 到达即记入 `cancelled`
-集合；若 cookie 匹配 current 则写取消文件 + `tmux display-popup -C` 兜底关闭；
-此后若同 cookie 的 `Request` 才到，直接回报取消不弹窗。
+`Request` handling does not block the read loop: it records the current cookie
+first, spawns a `run_popup` task, and reports back after the popup finishes
+(cleaning up the cancel file and the current marker). When a `Cancel` arrives it
+is recorded in `cancelled`; if the cookie matches `current`, it writes the
+cancel file + `tmux display-popup -C` as a fallback close; if a `Request` with
+the same cookie arrives afterwards, it reports cancellation directly without
+popping up.
 
-### 4.5 `prompt.rs`（弹窗单请求认证）
+### 4.5 `prompt.rs` (popup single-request auth)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `run` | 读 `POLKIT_*` 环境变量 → `Tui::open` → `App::open_prompt` → 四路 `select!` 事件循环 → 退出码 |
-| `Outcome` | `Success` / `Failure` / `Error(String)`，后台认证任务的回报 |
-| `authenticate_once` | 快照用户名/cookie/密码，10s 连 helper，30s 单消息 PAM 循环，返回 `Outcome` |
-| 取消文件轮询 | `POLKIT_CANCEL_FILE` 存在即置位 watch → 主循环 break 2 |
-| 空闲超时 | 编辑态且 `last_activity.elapsed() >= input_timeout` → break 1（非 0/2，映射 Failed） |
+| `run` | reads `POLKIT_*` env vars → `Tui::open` → `App::open_prompt` → four-way `select!` event loop → exit code |
+| `Outcome` | `Success` / `Failure` / `Error(String)`, the background auth task's report |
+| `authenticate_once` | snapshots username/cookie/password, 10s helper connect, 30s per-message PAM loop, returns `Outcome` |
+| Cancel-file polling | `POLKIT_CANCEL_FILE` present → set the watch → main loop `break 2` |
+| Idle timeout | editing state and `last_activity.elapsed() >= input_timeout` → `break 1` (neither 0 nor 2, mapped to Failed) |
 
-### 4.6 `helper.rs`（polkit-agent-helper-1 客户端）
+### 4.6 `helper.rs` (polkit-agent-helper-1 client)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `SOCKET_PATH`/`HELPER_BIN` | `/run/polkit/agent-helper.socket`（socket 激活优先）/ `/usr/lib/polkit-1/polkit-agent-helper-1`（setuid 回退） |
-| `Inner` | `Socket { reader, writer }`（`Box<dyn AsyncRead/Write>`）或 `Binary { reader, writer, _child, _stderr }`（持有 Child 防被 drop 杀进程） |
-| `connect` | socket 存在则连并按协议写「用户名、cookie」两行；否则 spawn 二进制、用户名走 argv、stdin 写 cookie |
-| `write_line` | 分两次写避免拼串分配 |
-| `respond` | 把密码/文本写回 helper |
-| `next_message` | 逐行解析：`PAM_PROMPT_ECHO_OFF/ON`、`PAM_ERROR_MSG`、`PAM_TEXT_INFO`、`SUCCESS`、`FAILURE`；未知命令按 `Info` 容错 |
+| `SOCKET_PATH`/`HELPER_BIN` | `/run/polkit/agent-helper.socket` (socket activation preferred) / `/usr/lib/polkit-1/polkit-agent-helper-1` (setuid fallback) |
+| `Inner` | `Socket { reader, writer }` (`Box<dyn AsyncRead/Write>`) or `Binary { reader, writer, _child, _stderr }` (holds the Child to keep the process from being killed on drop) |
+| `connect` | if the socket exists, connect and write the "username, cookie" two lines per protocol; otherwise spawn the binary, username via argv, cookie on stdin |
+| `write_line` | writes in two chunks to avoid string-concat allocation |
+| `respond` | writes the password/text back to the helper |
+| `next_message` | line-by-line parsing: `PAM_PROMPT_ECHO_OFF/ON`, `PAM_ERROR_MSG`, `PAM_TEXT_INFO`, `SUCCESS`, `FAILURE`; unknown commands tolerated as `Info` |
 
-### 4.7 `protocol.rs`（NDJSON 线协议）
+### 4.7 `protocol.rs` (NDJSON wire protocol)
 
-`AuthRequest`（cookie/user/action/message）、`AuthResult`（Ok/Cancel/Failed）、
-`ServerMsg`（`Request{id,req}` / `Cancel{cookie}`）、`ClientMsg`
-（`Response{id,result}`）。都用 `#[serde(tag="type", rename_all="lowercase")]`
-做标签化。密码永不进入这些消息。
+`AuthRequest` (cookie/user/action/message), `AuthResult` (Ok/Cancel/Failed),
+`ServerMsg` (`Request{id,req}` / `Cancel{cookie}`), `ClientMsg`
+(`Response{id,result}`). All tagged with
+`#[serde(tag="type", rename_all="lowercase")]`. Passwords never enter these
+messages.
 
-### 4.8 `ui.rs`（状态 + 渲染）
+### 4.8 `ui.rs` (state + rendering)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
 | `PromptAnswer` | `Submit(String)` / `Cancel` |
-| `UiEvent` | `Prompt`（携带 oneshot 应答通道与上一轮 status）/ `Cancel` / `Status` / `Dismiss`，都带 cookie |
-| `PromptState` | `Editing` / `Verifying`，渲染与输入行为据此分支 |
+| `UiEvent` | `Prompt` (carries the oneshot reply channel and the previous round's status) / `Cancel` / `Status` / `Dismiss`, all with a cookie |
+| `PromptState` | `Editing` / `Verifying`, rendering and input behavior branch on it |
 | `App` | `active: Option<ActivePrompt>` + `input: Vec<char>` + `cursor` |
-| `ActivePrompt` | cookie/username/message/action_id/status/state + `reply: Option<oneshot::Sender>`（`Option` 便于 `take()`） |
-| `handle_key` | Esc/Ctrl-C 取消、Enter 提交（空密码拒绝、切 Verifying）、Backspace/方向键/Home/End 编辑；Verifying 态只认取消 |
-| `on_event` | 消费 `UiEvent`，所有事件按 cookie 校验匹配当前对话框 |
-| `open_prompt` | `--prompt` 用，无 oneshot 应答通道 |
-| `retry` | 失败后回 Editing、清输入、更新状态行 |
-| `render`/`render_full` | inline 居中 60%×40% / 弹窗铺满全屏；无对话框时不画（空帧即清屏） |
-| `draw_dialog_at` | Clear → 标题/用户/消息/状态/掩码行 → 边框 → 光标定位（`PASSWORD_LABEL_W`=6 列，按 CJK 计） |
+| `ActivePrompt` | cookie/username/message/action_id/status/state + `reply: Option<oneshot::Sender>` (`Option` enables `take()`) |
+| `handle_key` | Esc/Ctrl-C cancels, Enter submits (empty password rejected, switches to Verifying), Backspace/arrows/Home/End edit; Verifying only accepts cancel |
+| `on_event` | consumes `UiEvent`, every event validates its cookie against the current dialog |
+| `open_prompt` | for `--prompt`, no oneshot reply channel |
+| `retry` | on failure, back to Editing, clears input, updates the status line |
+| `render`/`render_full` | inline centered 60%×40% / popup full-screen; nothing drawn when no dialog (empty frame = clear) |
+| `draw_dialog_at` | Clear → title/user/message/status/mask lines → border → cursor positioning (`PASSWORD_LABEL_W`=6 columns, counted in CJK) |
 
-### 4.9 `tui.rs`（`/dev/tty` 终端封装）
+### 4.9 `tui.rs` (`/dev/tty` terminal wrapper)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `has_controlling_tty` | 启动守卫：`/dev/tty` 能否以读写打开 |
-| `Tui` | `tty: File`（Drop 还原）+ `terminal: Terminal<CrosstermBackend<File>>`（绘制目标） |
-| `Tui::open` | 开 tty → raw mode → alternate screen → panic hook → 构建 Terminal；任一步失败都还原 |
-| `install_panic_hook` | 保存前一 hook，panic 时先 `disable_raw_mode` 再 `LeaveAlternateScreen` |
-| `Drop` | 同样序还原，任何退出路径（含 panic 展开）都保证终端不被破坏 |
-| `PANIC_TTY` | 全局 `Mutex<Option<File>>`，panic hook 用它操作终端 |
+| `has_controlling_tty` | startup guard: can `/dev/tty` be opened read-write |
+| `Tui` | `tty: File` (restored on Drop) + `terminal: Terminal<CrosstermBackend<File>>` (draw target) |
+| `Tui::open` | open tty → raw mode → alternate screen → panic hook → build Terminal; any failure restores everything |
+| `install_panic_hook` | saves the previous hook; on panic, `disable_raw_mode` then `LeaveAlternateScreen` |
+| `Drop` | restores in the same order, guaranteeing the terminal is never left broken on any exit path (including panic unwinding) |
+| `PANIC_TTY` | global `Mutex<Option<File>>`, used by the panic hook to operate the terminal |
 
-### 4.10 `logging.rs`（日志通道）
+### 4.10 `logging.rs` (log channels)
 
-| 项 | 内容 |
+| Item | Content |
 |---|---|
-| `TUI_ACTIVE` | `AtomicBool`，TUI 进入/还原时置位/复位 |
-| `log_line` | 日志走 stdout；TUI 活跃且 stdout 是终端时改写屏幕左上角安全区 |
-| `log_line_to_corner` | `SavePosition → MoveTo(0,0) → Clear(CurrentLine) → Print(按列宽截断) → RestorePosition` 一段字节一次写 |
-| `error_line` | 报错走 stderr，始终原文 |
+| `TUI_ACTIVE` | `AtomicBool`, set/reset when the TUI enters/restores |
+| `log_line` | logs to stdout; when the TUI is active and stdout is a terminal, writes to the safe area in the top-left corner of the screen |
+| `log_line_to_corner` | `SavePosition → MoveTo(0,0) → Clear(CurrentLine) → Print(truncated to column width) → RestorePosition` as one chunk |
+| `error_line` | errors to stderr, always verbatim |
 
-## 5. 数据流追踪
+## 5. Data flow traces
 
-### 5.1 inline：认证请求到密码回传
-
-```
- polkitd ──BeginAuthentication──▶ begin_authentication（agent.rs）
-                                     │ ① pick_username → 注册 cookie→watch
-                                     │ ② mpsc<UiEvent>::Prompt{oneshot,status}
-                                     ▼
-                                 App 对话框（ui.rs）◀── 键盘 EventStream（run_tui）
-                                     │ ③ Action → oneshot.send(PromptAnswer)
-                                     ▼
-                             authenticate_inline 拿到密码
-                                     │ ④ HelperSession::connect（10s 超时）
-                                     ▼
-                         polkit-agent-helper-1（root · PAM）
-                                     │ ⑤ 行协议循环（30s/消息）
-                                     │    PAM_ERROR/TEXT_INFO → UiEvent::Status
-                                     │ ⑥ SUCCESS → UiEvent::Dismiss
-                                     ▼
-                             返回 Ok → polkitd 放行（root helper 代调 Response2/3）
-```
-
-1. polkitd 调 `begin_authentication` → `pick_username` 选身份 → 往
-   `pending` 表插入 `(cookie, watch::Sender)`。
-2. `authenticate_inline` 每轮新建 oneshot，发 `UiEvent::Prompt`（带
-   `reply_tx`、上一轮 status）到 `mpsc<UiEvent>`。
-3. `run_tui` 的 `ui_events` 分支收到后置 `needs_full_redraw`，`app.on_event`
-   打开对话框。
-4. 键盘事件经 `app.handle_key` 产生 `Action` → `send_answer` `take()` 出
-   oneshot → `reply.send(PromptAnswer)`。
-5. agent 的 `select!` 收到密码 → 连 helper → PAM 循环；过程中的
-   `PAM_ERROR_MSG`/`PAM_TEXT_INFO` 经 `UiEvent::Status` 实时刷到对话框状态行。
-6. `SUCCESS` → 发 `UiEvent::Dismiss` 关框 → `begin_authentication` 返回 `Ok`；
-   失败 → 更新 status 回到第 2 步重试。
-
-### 5.2 daemon 链路：请求转发、弹窗、结果回报
+### 5.1 inline: auth request to password return
 
 ```
- begin_authentication（Daemon 后端）
+ polkitd ──BeginAuthentication──▶ begin_authentication (agent.rs)
+                                    │ ① pick_username → register cookie→watch
+                                    │ ② mpsc<UiEvent>::Prompt{oneshot,status}
+                                    ▼
+                                App dialog (ui.rs)◀── keyboard EventStream (run_tui)
+                                    │ ③ Action → oneshot.send(PromptAnswer)
+                                    ▼
+                            authenticate_inline gets the password
+                                    │ ④ HelperSession::connect (10s timeout)
+                                    ▼
+                        polkit-agent-helper-1 (root · PAM)
+                                    │ ⑤ line-protocol loop (30s/message)
+                                    │    PAM_ERROR/TEXT_INFO → UiEvent::Status
+                                    │ ⑥ SUCCESS → UiEvent::Dismiss
+                                    ▼
+                             return Ok → polkitd grants (root helper calls Response2/3)
+```
+
+1. polkitd calls `begin_authentication` → `pick_username` picks an identity →
+   inserts `(cookie, watch::Sender)` into the `pending` table.
+2. `authenticate_inline` creates a fresh oneshot each round and sends
+   `UiEvent::Prompt` (with `reply_tx` and the previous round's status) to
+   `mpsc<UiEvent>`.
+3. `run_tui`'s `ui_events` branch sets `needs_full_redraw` on receipt and
+   `app.on_event` opens the dialog.
+4. Keyboard events produce an `Action` via `app.handle_key` → `send_answer`
+   `take()`s the oneshot → `reply.send(PromptAnswer)`.
+5. The agent's `select!` receives the password → connects to the helper → PAM
+   loop; `PAM_ERROR_MSG`/`PAM_TEXT_INFO` during the process are pushed to the
+   dialog's status line in real time via `UiEvent::Status`.
+6. `SUCCESS` → send `UiEvent::Dismiss` to close the dialog →
+   `begin_authentication` returns `Ok`; on failure, update the status and
+   retry from step 2.
+
+### 5.2 daemon chain: request forwarding, popup, result reporting
+
+```
+ begin_authentication (Daemon backend)
        │ ① daemon.request(req)
        ▼
  ┌────────────────────────┐  ② ServerMsg::Request{id,req}  ┌───────────────────┐
- │  daemon（socket 服务端） │ ─────────────────────────────▶ │ controller（读循环） │
- │  id → pending 表        │         （socket NDJSON）       │ current=cookie     │
+ │  daemon (socket server) │ ─────────────────────────────▶ │ controller (read loop)│
+ │  id → pending table     │         (socket NDJSON)        │ current=cookie        │
  └────────────────────────┘                                └─────────┬─────────┘
        ▲                                                           │ ③ spawn run_popup
        │ ⑥ ClientMsg::Response{id,result}                           │    tmux display-popup -E
@@ -307,134 +335,155 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
        └────────────────────────────────────────────────────────────┘
                                                                      ▼
                                                            ┌──────────────────┐
-                                                           │ --prompt 弹窗进程  │
+                                                           │ --prompt process │
                                                            │ ④ App + helper PAM│
-                                                           │ ⑤ 退出码 0/2/其他   │
+                                                           │ ⑤ exit code 0/2/other│
                                                            └──────────────────┘
 ```
 
-1. `begin_authentication`（Daemon 后端）→ `daemon.request(AuthRequest)`。
-2. `request` 分配 `id`，把 oneshot 插入 `pending` 表，向当前 controller 发
-   `ServerMsg::Request{id, req}`，`select!` 等取消令牌或应答。
-3. controller 读循环收到 → 记录 current cookie → spawn `run_popup`。
-4. `run_popup` 用 `tmux display-popup -E` 起 `--prompt`，经 `-e POLKIT_*`
-   传 cookie/user/action/message/cancel_file，命令体是 `"<exe>" --prompt`。
-5. `--prompt` 进程内：`App::open_prompt` 画框 → 提交后 spawn
-   `authenticate_once` → helper PAM → 退出码。
-6. controller 把退出码映射 `AuthResult` → `ClientMsg::Response{id, result}` →
-   socket → daemon 读循环 → `pending.remove(id)` → oneshot 送进 `request`。
-7. `begin_authentication` 按 `AuthResult` 返回 Ok/Cancelled/Failed。
+1. `begin_authentication` (Daemon backend) → `daemon.request(AuthRequest)`.
+2. `request` allocates an `id`, inserts the oneshot into the `pending` table,
+   sends `ServerMsg::Request{id, req}` to the current controller, and
+   `select!`s on the cancel token or the reply.
+3. The controller read loop receives it → records the current cookie → spawns
+   `run_popup`.
+4. `run_popup` starts `--prompt` via `tmux display-popup -E`, passing
+   cookie/user/action/message/cancel_file through `-e POLKIT_*`; the command
+   body is `"<exe>" --prompt`.
+5. Inside `--prompt`: `App::open_prompt` draws the dialog → on submit spawns
+   `authenticate_once` → helper PAM → exit code.
+6. The controller maps the exit code to an `AuthResult` → `ClientMsg::Response{id,
+   result}` → socket → daemon read loop → `pending.remove(id)` → oneshot into
+   `request`.
+7. `begin_authentication` returns Ok/Cancelled/Failed per the `AuthResult`.
 
-### 5.3 取消链路（polkitd 主动取消）
+### 5.3 cancellation chain (polkitd-initiated cancel)
 
 ```
- polkitd ──CancelAuthentication(cookie)──▶ cancel_authentication（agent.rs）
-                                             │ pending[cookie].watch.send(true)
-                                             ▼
-                                  begin_authentication 的 select! 命中 → 返回 Cancelled
-                                             │
-                     ┌───────────────────────┴────────────────────────┐
-                     ▼ inline                                      ▼ daemon
-              UiEvent::Cancel 关框                          daemon.cancel(cookie)
-                                                                    │ ServerMsg::Cancel
-                                                                    ▼
-                                                             controller 匹配 current
-                                                                     │ 写取消文件 + display-popup -C
-                                                                     ▼
-                                                             --prompt 轮询到文件 → exit 2
+ polkitd ──CancelAuthentication(cookie)──▶ cancel_authentication (agent.rs)
+                                            │ pending[cookie].watch.send(true)
+                                            ▼
+                                 begin_authentication's select! hits → return Cancelled
+                                            │
+                    ┌───────────────────────┴────────────────────────┐
+                    ▼ inline                                      ▼ daemon
+             UiEvent::Cancel closes dialog                daemon.cancel(cookie)
+                                                                   │ ServerMsg::Cancel
+                                                                   ▼
+                                                            controller matches current
+                                                                   │ write cancel file + display-popup -C
+                                                                   ▼
+                                                            --prompt polls the file → exit 2
 ```
 
-1. polkitd 调 `cancel_authentication(cookie)`。
-2. agent 置位 `pending[cookie]` 的 watch；inline 后端再发 `UiEvent::Cancel`，
-   daemon 后端调 `daemon.cancel(cookie)`。
-3. inline：`authenticate_inline` 的 `select!` 命中 `cancel_rx.changed()` → 发
-   `UiEvent::Dismiss` → 返回 `Cancelled`。
-4. daemon 链路：`daemon.cancel` 发 `ServerMsg::Cancel`；controller 匹配
-   current cookie → 写取消文件 + `tmux display-popup -C`；`--prompt` 轮询到
-   文件退出 2；controller 回报的迟到 `Response` 无害（daemon 已通过本地
-   取消令牌返回，`pending` 表项已被 `PendingGuard` 清理）。
+1. polkitd calls `cancel_authentication(cookie)`.
+2. The agent sets the watch for `pending[cookie]`; the inline backend also
+   sends `UiEvent::Cancel`, the daemon backend calls `daemon.cancel(cookie)`.
+3. inline: `authenticate_inline`'s `select!` hits `cancel_rx.changed()` → sends
+   `UiEvent::Dismiss` → returns `Cancelled`.
+4. daemon chain: `daemon.cancel` sends `ServerMsg::Cancel`; the controller
+   matches the current cookie → writes the cancel file + `tmux display-popup
+   -C`; `--prompt` polls the file and exits 2; a late `Response` from the
+   controller is harmless (the daemon already returned via the local cancel
+   token, and the `pending` entry was cleaned by `PendingGuard`).
 
-### 5.4 关键对象生命周期
+### 5.4 key object lifetimes
 
-- **cookie**：从 polkitd 传入起贯穿 agent→daemon→controller→`--prompt`→
-  helper，是取消文件、`UiEvent`、`ServerMsg::Cancel` 的对齐键。
-- **请求 id**：`next_id` 递增，仅存在于 daemon 的 `pending` 表与 socket 消息，
-  用于关联 controller 的回报。
-- **取消令牌（watch）**：`begin_authentication` 插入、结束清理；`cancel` 只
-  查表置位，两者互不阻塞。
-- **`PendingGuard`**：Drop 清理保证 `request` 被 `select!` 放弃或超时时
-  `pending` 表不残留。
-- **socket 文件**：`Daemon::start` 时若残留且可连接则拒启，否则删除重绑。
+- **cookie**: from polkitd it travels agent→daemon→controller→`--prompt`→helper,
+  and is the alignment key for the cancel file, `UiEvent`, and
+  `ServerMsg::Cancel`.
+- **request id**: `next_id` increments; it exists only in the daemon's `pending`
+  table and socket messages, tying the controller's reply to its request.
+- **cancel token (watch)**: inserted by `begin_authentication`, cleaned up on
+  exit; `cancel` only looks up and sets — the two never block each other.
+- **`PendingGuard`**: Drop cleanup guarantees the `pending` table has no
+  residue after a `request` is abandoned by `select!` or times out.
+- **socket file**: `Daemon::start` refuses to start if a stale socket is
+  connectable, otherwise deletes and rebinds.
 
-## 6. 并发与同步模型
+## 6. Concurrency and synchronization model
 
-所有异步都跑在同一个 `#[tokio::main]` 多线程运行时；`select!` 决定谁能
-抢先，`Mutex` 只保护小片共享状态，不存在长时间持锁。
+All async code runs on the same `#[tokio::main]` multi-threaded runtime;
+`select!` decides who proceeds first, and `Mutex` only protects small pieces of
+shared state — no lock is ever held for long.
 
-`tokio::spawn` 点：
+`tokio::spawn` points:
 
-| 位置 | 任务 | 说明 |
+| Location | Task | Note |
 |---|---|---|
-| `daemon.rs start` | `accept_loop` | socket 接受循环 |
-| `daemon.rs accept_loop` | `handle_connection` | 每连接一个 |
-| `daemon.rs handle_connection` | 写任务 | 把 `ServerMsg` mpsc → NDJSON 写 socket |
+| `daemon.rs start` | `accept_loop` | socket accept loop |
+| `daemon.rs accept_loop` | `handle_connection` | one per connection |
+| `daemon.rs handle_connection` | writer task | `ServerMsg` mpsc → NDJSON to socket |
 | `controller.rs run` | `write_loop` | `ClientMsg` → socket |
-| `controller.rs run` | `run_popup` 任务 | 每请求一个，弹窗期间读循环不被阻塞 |
-| `main.rs tmux_main` | `controller::run` | 自连内嵌控制器 |
-| `prompt.rs run` | 取消文件轮询 | 200ms 查文件 |
-| `prompt.rs run` | `authenticate_once` | 每次提交一个，主循环保持响应 |
+| `controller.rs run` | `run_popup` task | one per request; read loop stays unblocked while a popup is open |
+| `main.rs tmux_main` | `controller::run` | embedded self-connecting controller |
+| `prompt.rs run` | cancel-file polling | checks the file every 200ms |
+| `prompt.rs run` | `authenticate_once` | one per submission, main loop stays responsive |
 
-`tokio::select!` 点：`main.rs run_tui`（keys/ui_events/tick）、
-`agent.rs begin_authentication`（排队：cancel/acquire；认证：cancel/request）、
-`agent.rs authenticate_inline`（cancel/reply/timeout/activity）、`prompt.rs run`
-（keys/outcome/cancel/tick）。
+`tokio::select!` points: `main.rs run_tui` (keys/ui_events/tick),
+`agent.rs begin_authentication` (queueing: cancel/acquire; auth: cancel/request),
+`agent.rs authenticate_inline` (cancel/reply/timeout/activity), `prompt.rs run`
+(keys/outcome/cancel/tick).
 
-`Mutex` 保护点：`agent.pending`（取消令牌表）、`Daemon.pending`（请求应答表）、
-`Daemon.active`（当前 controller）、`controller.current`（当前弹窗 cookie）、
-`controller.cancelled`（已取消 cookie 集合）、`PANIC_TTY`。`AtomicBool`：
-`TUI_ACTIVE`；`AtomicU64`：`conn_seq`（连接 generation）、`next_id`（请求序号）。
+`Mutex`-protected points: `agent.pending` (cancel-token table), `Daemon.pending`
+(request-reply table), `Daemon.active` (current controller),
+`controller.current` (current popup cookie), `controller.cancelled` (cancelled
+cookie set), `PANIC_TTY`. `AtomicBool`: `TUI_ACTIVE`; `AtomicU64`: `conn_seq`
+(connection generation), `next_id` (request sequence).
 
-## 7. 超时体系
+## 7. Timeout system
 
-| 超时 | 位置 | 默认 | 触发后果 |
+| Timeout | Location | Default | Consequence |
 |---|---|---|---|
-| helper 连接 | `agent.rs`/`prompt.rs` | 10s | 判失败，回到重试 |
-| PAM 单条消息 | `agent.rs`/`prompt.rs` | 30s | 判失败，回到重试（防 PAM 挂起） |
-| 输入空闲 | `agent.rs`/`prompt.rs` | 30s（`POLKIT_TUI_TIMEOUT` 覆盖） | inline：整轮失败；prompt：退出码 1 |
-| daemon 响应 | `daemon.rs request` | 120s | 主动 `cancel` 关弹窗，返回超时错误 |
+| helper connect | `agent.rs`/`prompt.rs` | 10s | treated as failure, back to retry |
+| PAM single message | `agent.rs`/`prompt.rs` | 30s | treated as failure, back to retry (guard against hung PAM) |
+| input idle | `agent.rs`/`prompt.rs` | 30s (`POLKIT_TUI_TIMEOUT` overrides) | inline: whole round fails; prompt: exit code 1 |
+| daemon response | `daemon.rs request` | 120s | actively `cancel`s and closes the popup, returns a timeout error |
 
-inline 与弹窗的实现路径不同但语义一致——**键盘输入、提交、验证失败都算活动**：
+inline and popup differ in implementation but share the same semantics —
+**keyboard input, submission, and failed verification all count as activity**:
 
-- **inline（`agent.rs`）**：UI 每次按键经 `activity` watch 通道回流刷新
-  `last_activity`；提交、验证失败回到循环顶部同样刷新。只有持续无操作才超时。
-- **弹窗（`prompt.rs`）**：`last_activity` 在键盘事件与验证失败回报时刷新，
-  仅编辑态计入超时判定（验证中不计）。
+- **inline (`agent.rs`)**: every keypress refreshes `last_activity` back
+  through the `activity` watch channel; submission and failed verification also
+  refresh when the loop returns to its top. Only continuous inactivity times
+  out.
+- **popup (`prompt.rs`)**: `last_activity` refreshes on keyboard events and
+  failure reports; only the editing state counts toward the timeout (verifying
+  does not).
 
-## 8. 安全边界
+## 8. Security boundaries
 
-- **密码只在私有通道**：agent ↔ root helper 之间走 Unix socket 或匿名
-  stdin/stdout 管道；D-Bus、socket NDJSON、环境变量、日志里都没有密码。
-- **daemon socket 只收同用户**：`handle_connection` 校验 `peer_cred().uid()`
-  等于当前 uid；socket 位于 `$XDG_RUNTIME_DIR`（0700）内，peer_cred 是纵深
-  防御。
-- **防双 daemon**：`Daemon::start` 对残留 socket 先探测能否连接，能连即拒启。
-- **取消文件**：仅作取消信号（内容固定 `"cancel"`），路径含 FNV-1a hash，
-  不泄露 cookie 明文。
-- **弹窗传参用环境变量**：`run_popup` 经 `-e` 传请求字段，命令体只拼
-  当前 exe 路径（加引号防空格），避免把消息内容插进 shell。
-- **身份解析**：手动解 `(String, HashMap)` 元组，跳过 `unix-group` 等不支持
-  的 identity；未知 PAM 命令按 `Info` 容错不误伤。
-- **诊断脱敏**：日志里 cookie 默认以 FNV-1a 哈希（16 位 hex）表示
-  （`log_cookie`），完整会话标识不外泄；排查时加 `--full-cookie-log` 打印全量。
+- **Passwords live only on the private channel**: between the agent and the
+  root helper over a Unix socket or anonymous stdin/stdout pipes; no password
+  ever appears on D-Bus, socket NDJSON, environment variables, or logs.
+- **daemon socket accepts only the same user**: `handle_connection` checks that
+  `peer_cred().uid()` equals the current uid; the socket lives inside
+  `$XDG_RUNTIME_DIR` (0700), and peer_cred is defense in depth.
+- **No dual daemon**: `Daemon::start` probes whether a stale socket can be
+  connected to; if so, it refuses to start.
+- **Cancel file**: only a cancel signal (content fixed as `"cancel"`); its path
+  contains an FNV-1a hash and does not leak the raw cookie.
+- **Popup args via environment variables**: `run_popup` passes request fields
+  through `-e`; the command body only concatenates the current exe path (quoted
+  against spaces), never injecting message content into a shell.
+- **Identity parsing**: manually decodes the `(String, HashMap)` tuple and
+  skips unsupported identities such as `unix-group`; unknown PAM commands are
+  tolerated as `Info` instead of failing hard.
+- **Diagnostics redaction**: cookies in logs default to an FNV-1a hash (16 hex
+  digits) via `log_cookie`, so the full session identifier is not exposed; add
+  `--full-cookie-log` when troubleshooting to print full values.
 
-## 9. 已知行为差异（inline vs 弹窗）
+## 9. Known behavior differences (inline vs popup)
 
-文档如实记录、代码未强求一致的差异点：
+Differences that are honestly documented but not forced to match in code:
 
-- **PAM 消息展示**：inline 把 `PAM_ERROR_MSG`/`PAM_TEXT_INFO` 经
-  `UiEvent::Status` 显示到对话框状态行；弹窗的 `authenticate_once` 不展示，
-  直接按 FAILURE/EOF 判失败（密码错误通常由 helper 回 `FAILURE`，影响有限）。
-- **验证中取消**：弹窗在 Verifying 态仍接受 Esc/Ctrl-C 取消（`run` 的键盘
-  分支先于 `handle_key` 判断）；inline 的 `App::handle_key` 在 Verifying 态
-  返回 `None`，且 `run_tui` 的退出判断要求 `active.is_none()`，故 inline
-  验证中不可取消，只能等结果。
+- **PAM message display**: inline shows `PAM_ERROR_MSG`/`PAM_TEXT_INFO` on the
+  dialog's status line via `UiEvent::Status`; the popup's `authenticate_once`
+  does not display them and simply treats FAILURE/EOF as failure (wrong
+  passwords usually come back as `FAILURE` from the helper, so the impact is
+  limited).
+- **Cancelling during verification**: the popup still accepts Esc/Ctrl-C
+  cancellation in the Verifying state (the keyboard branch in `run` is checked
+  before `handle_key`); inline's `App::handle_key` returns `None` in the
+  Verifying state, and `run_tui`'s exit check requires `active.is_none()`, so
+  inline cannot cancel during verification and can only wait for the result.

@@ -134,4 +134,13 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → 弹窗进
 ## 约定
 - 注释与模块文档一律中文，沿用现有风格
 - 缩进 2 空格（由 rustfmt.toml 的 tab_spaces=2 配置）
-- 非 git 仓库，无分支/提交规范
+- git 仓库：远端 `git@github.com:CcendercatcC/Polkit-TUI-Agent.git`，默认分支 `main`
+
+## 提交纪律
+- Agent 一律不执行任何 git 写操作（commit / push / rebase / amend /
+  force-push / merge 等），所有 git 操作由用户负责
+- 涉及 git 时 Agent 只做只读查询（`git status` / `git diff` / `git log`）用于
+  报告与核对，不产生任何改动
+- 用户要求时，Agent 可提供 commit message 建议文本，提交动作仍由用户自行执行
+- 提交前用户自行核对暂存范围；Agent 可协助指出未跟踪或多余文件
+  （如 target/、临时文件）

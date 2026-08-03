@@ -1,71 +1,91 @@
 # polkit-tui-agent
 
-一个用 Rust 编写的 **终端 polkit 认证代理**（authentication agent），为
-ssh / tmux 等无图形界面场景设计。
+> 中文版本: [README_cn.md](README_cn.md)
+
+A **terminal polkit authentication agent** written in Rust, built for
+headless environments such as ssh / tmux.
 
 > This project is developed with AI assistance.
 
-当 `pkexec`、`pkcheck` 等机制发起权限提升请求时，polkit 需要一个「认证代理」
-来弹出密码输入框。本程序提供两种 UI：
+When `pkexec`, `pkcheck`, and friends trigger a privilege escalation request,
+polkit needs an **authentication agent** to show a password prompt. This program
+provides two UIs:
 
-- **inline TUI**：在运行它的终端里画对话框（ratatui）。
-- **tmux popup**：在 tmux 会话内注册并常驻，认证请求出现时用 `tmux display-popup`
-  在屏幕正中央悬浮弹窗（`--tmux` 一体模式，或 `--daemon` + `--controller` 分离部署）。
+- **inline TUI**: draws a dialog in the terminal it runs in (ratatui).
+- **tmux popup**: registers and stays resident inside a tmux session; when an
+  auth request arrives it pops up a floating dialog in the center of the screen
+  via `tmux display-popup` (`--tmux` all-in-one mode, or a `--daemon` +
+  `--controller` split deployment).
 
-纯 Rust 实现，零 GTK/glib 依赖。
+Pure Rust, zero GTK/glib dependencies.
 
-## 功能特性
+## Features
 
-- 纯终端渲染（ratatui + crossterm），无任何图形依赖
-- 只使用 **system bus**，不依赖 `DBUS_SESSION_BUS_ADDRESS`（ssh 会话可用）
-- tmux 悬浮弹窗（`display-popup`），不占用你的布局
-- `--tmux` 一体模式：单进程搞定注册 + 弹窗，无需两个进程
-- helper 双路径：systemd socket 激活优先，setuid 二进制回退
-- 密码全程不经过 D-Bus，只在 agent ↔ root helper 的私有通道传递
-- 错误密码自动重试、Esc/Ctrl-C 取消、10s 连接超时兜底（helper 连接，inline 与弹窗模式均有）
-- 并发认证请求 FIFO 排队：同时触发多个 pkexec 时逐个弹框验证，不互相挤掉；排队期间取消的请求不弹框、不占位
-- PAM 会话单条消息 30s 超时：helper 长时间无响应（PAM 挂起）即判失败重试，不卡死认证
-- 等待输入密码超时（默认 30s，`POLKIT_TUI_TIMEOUT` 环境变量可覆盖）：空闲超时语义——输入、提交、验证失败反馈都算活动并刷新计时，只有持续无操作才超时
-- daemon 侧 120s 认证超时兜底：controller 迟迟不回报结果时自动失败，避免认证永久挂起
-- daemon socket 校验对端 uid（`SO_PEERCRED`），只接受同用户 controller 连接
-- 取消认证双通道关弹窗：取消文件让弹窗进程自行退出 + `display-popup -C` 兜底
+- Pure terminal rendering (ratatui + crossterm), no GUI dependencies
+- Uses only the **system bus** — no dependency on `DBUS_SESSION_BUS_ADDRESS`
+  (works over ssh sessions)
+- tmux floating popup (`display-popup`), does not disturb your layout
+- `--tmux` all-in-one mode: a single process does registration + popup, no
+  need for two processes
+- Dual helper paths: systemd socket activation preferred, setuid binary
+  fallback
+- Passwords never cross D-Bus; they travel only through the private
+  agent ↔ root helper channel
+- Wrong-password auto retry, Esc/Ctrl-C cancel, 10s connection timeout
+  fallback (helper connect, both inline and popup modes)
+- Concurrent auth requests are FIFO-queued: when several `pkexec` fire at once,
+  each is verified one dialog at a time without clobbering each other; requests
+  cancelled while queued never show a dialog nor occupy a slot
+- 30s timeout per PAM message: if the helper stays silent (hung PAM) it is
+  treated as a failure and retried, never blocks authentication forever
+- Password-input idle timeout (default 30s, overridable via the
+  `POLKIT_TUI_TIMEOUT` env var): idle-timeout semantics — typing, submitting,
+  and failure feedback all count as activity and refresh the timer; only
+  continuous inactivity times out
+- 120s daemon-side auth timeout fallback: if the controller never reports back,
+  the request fails automatically instead of hanging forever
+- Daemon socket validates the peer uid (`SO_PEERCRED`), only accepts
+  controllers owned by the same user
+- Two-channel popup cancellation: a cancel file makes the popup process exit
+  by itself, plus `display-popup -C` as a fallback
 
-## 编译与运行
+## Build & Run
 
 ```bash
 cargo build --release
 ```
 
-四种运行形态（外加 `--prompt` 内部弹窗模式）：
+Four run modes (plus the internal `--prompt` popup mode):
 
-| 模式 | 命令 | 场景 |
+| Mode | Command | Use case |
 |---|---|---|
-| inline TUI | `./target/release/polkit-tui-agent` | 直接在当前终端弹框 |
-| **tmux 一体（推荐）** | `./target/release/polkit-tui-agent --tmux` | 在 tmux 窗格内跑，请求时悬浮弹窗 |
-| 后台服务 | `./target/release/polkit-tui-agent --daemon` | headless，配 systemd user 服务 |
-| tmux 控制器 | `./target/release/polkit-tui-agent --controller` | 配 `--daemon` 分离部署，必须在 tmux 窗格内 |
-| 弹窗（内部） | `./target/release/polkit-tui-agent --prompt` | 由 controller 自动拉起，勿手动运行 |
+| inline TUI | `./target/release/polkit-tui-agent` | Pops a dialog directly in the current terminal |
+| **tmux all-in-one (recommended)** | `./target/release/polkit-tui-agent --tmux` | Run inside a tmux pane; floating popup on requests |
+| Background daemon | `./target/release/polkit-tui-agent --daemon` | Headless, with a systemd user service |
+| tmux controller | `./target/release/polkit-tui-agent --controller` | Split deployment with `--daemon`; must run in a tmux pane |
+| Popup (internal) | `./target/release/polkit-tui-agent --prompt` | Spawned by the controller; do not run manually |
 
-选项：
+Options:
 
-| 参数 | 说明 |
+| Flag | Description |
 |---|---|
-| `--locale <LOCALE>` | 传给 polkitd 的 locale，默认取 `$LANG` |
-| `--full-cookie-log` | 日志里打印完整 polkit cookie 而非 FNV-1a 哈希（排查/调试用） |
-| `-h, --help` | 帮助 |
+| `--locale <LOCALE>` | Locale sent to polkitd, defaults to `$LANG` |
+| `--full-cookie-log` | Log the full polkit cookie instead of the FNV-1a hash (troubleshooting/debugging) |
+| `-h, --help` | Help |
 
-### tmux 一体模式（推荐用法）
+### tmux all-in-one mode (recommended)
 
 ```bash
-# 在 tmux 的某个窗格里启动（可放一个专门的小窗格/窗口）
+# Start it in a tmux pane (a dedicated small pane/window works well)
 ./target/release/polkit-tui-agent --tmux
 ```
 
-之后任何 `pkexec` / `pkcheck` 请求都会在你屏幕正中央弹出认证框。
+From then on, any `pkexec` / `pkcheck` request pops an auth dialog right in the
+center of your screen.
 
-### 分离部署（systemd user 服务 + tmux 控制器）
+### Split deployment (systemd user service + tmux controller)
 
-`~/.config/systemd/user/polkit-tui-agent.service`：
+`~/.config/systemd/user/polkit-tui-agent.service`:
 
 ```ini
 [Unit]
@@ -74,8 +94,9 @@ After=dbus.service
 
 [Service]
 Type=simple
-# --uid-session：注册到 uid 图形会话，服务 SSH attach 的 tmux 窗格/桌面进程
-# 发起的认证请求（桌面 polkit agent 的行为）；若只在本地桌面会话内使用可去掉
+# --uid-session: register to the uid's graphical session, so auth requests from
+# SSH-attached tmux panes / desktop processes are served (the behavior of a
+# desktop polkit agent); drop it if you only use the local desktop session
 ExecStart=/home/EMeowSystem/Documents/Rust/polkit-tui-agent/target/release/polkit-tui-agent --daemon --uid-session
 Restart=on-failure
 
@@ -86,96 +107,106 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now polkit-tui-agent
-# tmux 窗格里再跑一个控制器
+# Run a controller in a tmux pane
 ./target/release/polkit-tui-agent --controller
 ```
 
-### 与其他认证代理共存
+### Coexisting with other auth agents
 
-同一 session scope 同时只能有一个 agent——这是 polkit 的限制：
-`RegisterAuthenticationAgent` 对同一 subject 只接受一个注册，`fallback` 选项
-也不会改变这一点（它只在匹配时生效）。若本机已运行
-polkit-gnome-authentication-agent 等，本程序注册会失败：
+Only one agent can exist per session scope at a time — this is a polkit
+limitation: `RegisterAuthenticationAgent` accepts a single registration per
+subject, and the `fallback` option does not change that (it only applies when
+matching). If a polkit-gnome-authentication-agent or similar is already
+running, registration fails:
 
 ```
 An authentication agent already exists for the given subject
 ```
 
-**共存不可行**，只能停掉现有 agent 改用本程序（例如 niri 的 gnome agent）：
+**Coexistence is not possible** — you must stop the existing agent and switch
+to this program (e.g. niri's gnome agent):
 
 ```bash
 systemctl --user stop 'app-niri-polkit\x2dgnome\x2dauthentication\x2dagent\x2d1-2352.scope'
 ```
 
-> 注：polkit 的进程 scope（`unix-process`）注册只能服务「该进程自身」发起的
-> 认证请求，无法服务其他进程（如 `pkexec`），因此没有可用的共存方案。
+> Note: a `unix-process` scope registration can only serve auth requests made
+> by that process itself, never other processes (such as `pkexec`), so there is
+> no usable coexistence scheme.
 
-### SSH 下使用
+### Using over SSH
 
-polkit 只按「请求进程与 agent 是否**同一 session**」匹配，所以 agent 注册的
-session 必须等于**请求被 polkit 算到的 session**。SSH 登录本身就是一个 logind
-session（`XDG_SESSION_ID` 由 pam_systemd 注入），SSH 终端里直接跑 inline 或
-`--tmux` 即可：
+polkit matches a request to the agent only by "**same session**", so the
+session the agent registers must equal the session the request is attributed
+to. An SSH login is itself a logind session (`XDG_SESSION_ID` is injected by
+pam_systemd); running inline or `--tmux` directly in an SSH terminal just
+works:
 
 ```bash
-# 方案一：SSH 终端里直接跑 inline（agent 注册到当前 SSH 会话）
+# Option 1: run inline directly in the SSH terminal (registers to the SSH session)
 ./target/release/polkit-tui-agent
 
-# 方案二：SSH 会话内启动 tmux，在窗格里跑 --tmux
+# Option 2: start tmux inside the SSH session and run --tmux in a pane
 tmux new -As main
-# 窗格内：
+# inside the pane:
 ./target/release/polkit-tui-agent --tmux
 ```
 
-**从 tmux 窗格发起提权**时另有讲究：如果 tmux server 是从桌面终端启动的
-（SSH 只是 attach），窗格进程不在任何 logind session 的 cgroup 里，polkit 会
-按 uid 把它算进**桌面图形会话**——这种情况下只有注册在桌面会话的 agent
-才能收到请求，桌面 gnome agent 正是这么工作的。要让本程序获得同样行为，
-注册时加 `--uid-session`：
+**Escalating from a tmux pane** has a subtlety: if the tmux server was started
+from a desktop terminal (SSH merely attaches), the pane process is not inside
+any logind session's cgroup, so polkit attributes it to the **desktop
+graphical session** by uid — in that case only an agent registered in the
+desktop session receives the request, which is exactly how the desktop gnome
+agent works. To give this program the same behavior, register with
+`--uid-session`:
 
 ```bash
-# 桌面侧：注册到 uid 图形会话（桌面 polkit agent 的行为）
+# Desktop side: register to the uid's graphical session (desktop polkit agent behavior)
 ./target/release/polkit-tui-agent --daemon --uid-session
-# SSH 的 tmux 窗格里：连 daemon 弹框
+# Inside the SSH-attached tmux pane: connect to the daemon to show the dialog
 ./target/release/polkit-tui-agent --controller
 ```
 
-之后从 SSH attach 的 tmux 窗格（乃至桌面环境）发起的 `pkexec` 都会弹框。
-注意 `--uid-session` 注册的是桌面会话，与桌面上的 gnome agent 冲突，需先停掉
-后者（见上节）。
+From then on, `pkexec` requests from SSH-attached tmux panes (and even the
+desktop environment) pop a dialog. Note that `--uid-session` registers to the
+desktop session and conflicts with the desktop gnome agent — stop the latter
+first (see the previous section).
 
-## 测试
+## Testing
 
-inline 模式：
+Inline mode:
 
 ```bash
-# 终端 A：启动 agent
+# Terminal A: start the agent
 ./target/release/polkit-tui-agent
-# 终端 B（同会话）：触发一次认证
+# Terminal B (same session): trigger an auth
 pkexec echo ok
 ```
 
-tmux 模式：
+tmux mode:
 
 ```bash
-# tmux 窗格 A：一体模式
+# tmux pane A: all-in-one mode
 ./target/release/polkit-tui-agent --tmux
-# tmux 窗格 B：触发认证
+# tmux pane B: trigger an auth
 pkexec echo ok
 ```
 
-验证点：弹框 → 错误密码显示「认证失败，请重试」→ Esc 取消（pkexec 报
-`Request dismissed`）→ 正确密码执行成功。
+Verification points: dialog pops up → wrong password shows
+「认证失败，请重试」(auth failed, try again) → Esc cancels (pkexec reports
+`Request dismissed`) → correct password succeeds.
 
-附加验证点：
-- 弹窗出现后不操作，30s 后自动关闭、pkexec 报认证失败（时长可经
-  `POLKIT_TUI_TIMEOUT` 调整）
-- 弹窗出现后 Ctrl-C 终止发起提权的 pkexec，弹窗应立即自动关闭；daemon 与
-  controller 的 stderr 会打印 `begin_authentication/cancel_authentication/
-  daemon cancel/controller cancel` 日志便于核对取消链路。
+Additional verification points:
+- Leave the popup untouched: it closes after 30s and pkexec reports auth
+  failure (duration adjustable via `POLKIT_TUI_TIMEOUT`)
+- Press Ctrl-C to kill the escalating pkexec after the popup appears: the popup
+  should close immediately; the daemon and controller print
+  `begin_authentication/cancel_authentication/daemon cancel/controller cancel`
+  logs to stderr for tracing the cancellation chain.
 
-## 许可
+## License
 
-GPL-3.0-or-later，见 [LICENSE](LICENSE)。
+GPL-3.0-or-later, see [LICENSE](LICENSE).
 
-> 开发者文档：程序内架构见 [ARCHITECTURE.md](ARCHITECTURE.md)，改代码注意事项见 [AGENTS.md](AGENTS.md)。
+> Developer docs: internal architecture in [ARCHITECTURE.md](ARCHITECTURE.md),
+> code-change notes in [AGENTS.md](AGENTS.md).

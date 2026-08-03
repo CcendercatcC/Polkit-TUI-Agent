@@ -299,7 +299,9 @@ async fn tmux_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .object_server()
     .at(OBJECT_PATH, Agent::daemon(daemon))
     .await?;
-  logging::log_line(&format!("polkit-tui-agent: tmux all-in-one listening on {socket}"));
+  logging::log_line(&format!(
+    "polkit-tui-agent: tmux all-in-one listening on {socket}"
+  ));
 
   // 常驻等待 D-Bus 调用；进程退出时 polkitd 自动清理。
   std::future::pending::<()>().await;
@@ -492,7 +494,10 @@ async fn inline_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
   // 把 Agent 导出为 D-Bus 对象。此时接口可被调用，但还没在 polkitd 注册。
   conn
     .object_server()
-    .at(OBJECT_PATH, Agent::inline(ui_tx.clone(), activity_tx.clone()))
+    .at(
+      OBJECT_PATH,
+      Agent::inline(ui_tx.clone(), activity_tx.clone()),
+    )
     .await?;
 
   let subject = build_subject(&conn, &opts)

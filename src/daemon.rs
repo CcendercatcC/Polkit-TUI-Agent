@@ -107,7 +107,10 @@ impl Daemon {
       return Err("no controller connected".to_string());
     };
     sender
-      .send(ServerMsg::Request { id, req: req.clone() })
+      .send(ServerMsg::Request {
+        id,
+        req: req.clone(),
+      })
       .await
       .map_err(|_| "controller gone".to_string())?;
 
@@ -168,7 +171,9 @@ async fn handle_connection(stream: UnixStream, daemon: Arc<Daemon>) {
     }
   };
   if uid != uzers::get_current_uid() {
-    crate::logging::error_line(&format!("polkit-tui-agent: rejected connection from uid {uid}"));
+    crate::logging::error_line(&format!(
+      "polkit-tui-agent: rejected connection from uid {uid}"
+    ));
     return;
   }
 

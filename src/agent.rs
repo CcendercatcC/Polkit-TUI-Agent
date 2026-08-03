@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
-use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use zbus::DBusError;
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
@@ -230,12 +230,12 @@ impl Agent {
         }
         p = self.slot.acquire() => p,
     } {
-        Ok(p) => p,
-        Err(_) => {
-            // 信号量被关闭（Agent 生命周期内不会发生），按失败处理。
-            self.pending.lock().unwrap().remove(&cookie);
-            return Err(PolkitError::Failed);
-        }
+      Ok(p) => p,
+      Err(_) => {
+        // 信号量被关闭（Agent 生命周期内不会发生），按失败处理。
+        self.pending.lock().unwrap().remove(&cookie);
+        return Err(PolkitError::Failed);
+      }
     };
 
     // 获得名额瞬间的兜底：select 可能选了 acquire 而取消值恰好已置位。
@@ -404,14 +404,14 @@ impl Agent {
       // 单条消息 30s 超时：helper 长时间无响应（PAM 挂起）时判失败重试，不卡死认证。
       let mut succeeded = false;
       loop {
-        let msg =
-          match tokio::time::timeout(Duration::from_secs(30), session.next_message()).await {
-            Ok(r) => r,
-            Err(_) => {
-              status = "认证超时，请重试".to_string();
-              break;
-            }
-          };
+        let msg = match tokio::time::timeout(Duration::from_secs(30), session.next_message()).await
+        {
+          Ok(r) => r,
+          Err(_) => {
+            status = "认证超时，请重试".to_string();
+            break;
+          }
+        };
         match msg {
           // 不回显的提示：这里就是密码，回传本轮输入的密码。
           Ok(Some(PamMessage::PromptEchoOff(t))) => {

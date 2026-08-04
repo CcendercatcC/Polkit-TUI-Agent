@@ -1,9 +1,15 @@
 [package]
 name = "polkit-tui-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A TUI polkit authentication agent for the terminal (ssh/tmux friendly)"
+repository = "https://github.com/CcendercatcC/Polkit-TUI-Agent"
+
+[package.metadata.binstall]
+pkg-url = "https://github.com/CcendercatcC/Polkit-TUI-Agent/releases/download/v{ version }/polkit-tui-agent-{ target }-v{ version }.tgz"
+pkg-fmt = "tgz"
+
 
 [dependencies]
 ratatui = "0.30"

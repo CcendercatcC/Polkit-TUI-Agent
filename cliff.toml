@@ -1,3 +1,33 @@
+[changelog]
+trim = false
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [unreleased]
+{% endif %}
+## 安装 / Installation
+
+用 cargo-binstall 直接拉取本 release 的预编译二进制：
+
+Install the pre-built binary with cargo-binstall:
+
+```sh
+cargo binstall --git https://github.com/CcendercatcC/Polkit-TUI-Agent.git polkit-tui-agent
+```
+
+或手动下载本 release 的 `polkit-tui-agent-x86_64-unknown-linux-musl-*.tgz` 解包到 PATH。
+
+Or download the `polkit-tui-agent-x86_64-unknown-linux-musl-*.tgz` tarball from this release and extract it into your PATH.
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message }}\
+{% endfor %}
+{% endfor %}
+"""
+
 [git]
 conventional_commits = false
 commit_parsers = [

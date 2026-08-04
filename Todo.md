@@ -60,6 +60,35 @@
     tmux send-keys -t t 'POLKIT_COOKIE=fake POLKIT_USER=root POLKIT_MESSAGE=phishing ./target/release/polkit-tui-agent --prompt' Enter
     ```
     修复后此手动调用应被拒绝（报令牌缺失），controller 正常路径仍可用。
+- [ ] **cookie 经 `-e POLKIT_COOKIE` 暴露于 environ**（controller.rs:192，
+      Medium）：cookie 写进弹窗进程 environ，同 uid 进程可读
+      `/proc/<pid>/environ` 拿到真实 cookie。**危害边界**：cookie 本身无法
+      伪造成功认证（root helper 才可调 `AuthenticationAgentResponse2/3`），
+      但配合上方「钓鱼面」条目会降低社工门槛；另同 uid 已能从 daemon socket
+      （peer_cred 仅校验同 uid）读到 Request 中的 cookie，故属纵深防御。
+      修复：controller 按请求起一个临时 `UnixListener`
+      （`$XDG_RUNTIME_DIR/polkit-tui-ctrl-<fnv1a_hex>`），经 `-e
+      POLKIT_CTRL_SOCK=<path>` 把路径传给 popup；popup 启动后连上去读一行
+      cookie 随即断开；controller accept 一次后关 listener。user/action/
+      message 等展示信息不敏感，继续走 `-e`。与现有 daemon↔controller NDJSON
+      socket 同一模式（socket + 行协议），无文件清理 / race 问题，无新增依赖。
+  - 测试（手动）：弹窗进程 environ 中不再有 `POLKIT_COOKIE`
+    （只剩 `POLKIT_CTRL_SOCK` 路径），正常认证仍可用。
+- [ ] **popup↔controller 通讯全面走 socket，禁止通过 `-e` 环境变量传参**
+      （controller.rs:191-201 / prompt.rs:26-29）：现有设计把
+      cookie、user、action、message、cancel_file 全部经 `tmux
+      display-popup -e` 塞进弹窗进程 environ，同 uid 可被动枚举
+      `/proc/<pid>/environ` 拿到全部请求上下文。应改为：controller 在每
+      次弹窗前起一个临时 `UnixListener`（`$XDG_RUNTIME_DIR/polkit-tui-
+      popup-<fnv1a_hex>`），仅把 socket 路径经 `-e POLKIT_SOCK=<path>` 传入；
+      popup 启动后连上该 socket、收到一个完整 `AuthRequest`（含 cookie、
+      user、action、message、cancel_file 路径）后断开；controller accept
+      一次即关 listener。user/action/message 虽不敏感但一并迁出 env
+      可消除 `/proc/environ` 的信息泄露面。与现有 daemon↔controller NDJSON
+      socket 完全同模式（socket + 行协议），无新增依赖，无文件清理 / race 问题。
+  - 测试（手动）：弹窗期间 `tr '\0' '\n' < /proc/<pid>/environ | head`
+    应只含 `POLKIT_SOCK` 路径，cookie/user/action/message 均不可见；
+    正常认证仍可用。
 - [ ] **剥离 TUI 渲染文本的控制字节**（ui.rs:270,283 / controller.rs:198）：
       `message`/`action_id` 来自 polkitd，若含 ANSI/ESC 会原样输出到
       `/dev/tty`（终端注入）。渲染前过滤 `\x1b` 等控制字符。
@@ -82,9 +111,6 @@
   密码才延续，属正常交互，不是程序缺陷。
 - exe 路径双引号拼接进 shell（controller.rs:180）：路径含 `$`/反引号时会被
   展开，但路径由用户安装位置决定，风险低。可选：单引号转义。
-- cookie 经 `-e POLKIT_COOKIE` 暴露于 argv/environ（controller.rs:192）：
-  同 uid 进程可读，但 cookie 泄露无法伪造成功认证（root helper 才可调
-  `AuthenticationAgentResponse2/3`）。设计权衡，保留。
 - 排队期间取消与 reply 竞态可能返回 `Failed` 而非 `Cancelled`
   （agent.rs:221-245）：仅影响 pkexec 报错文案，概率低。
 - daemon socket 显式 chmod 0700（daemon.rs:74）：删除 /tmp 回退后，socket

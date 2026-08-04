@@ -67,7 +67,7 @@ Arrows show the `use` dependency direction. Runtime collaboration:
 | `agent` | `helper` | `HelperSession`: dual socket/binary paths to the root helper, line-protocol responses |
 | `agent` | `daemon` | `daemon.request(AuthRequest) -> AuthResult`, `daemon.cancel(cookie)` |
 | `daemon` | `controller` | socket NDJSON: `ServerMsg` (Request/Cancel) / `ClientMsg` (Response) |
-| `controller` | `prompt` | Spawns `--prompt` via `tmux display-popup -E` + `POLKIT_*` env vars |
+| `controller` | `prompt` | Spawns `--prompt` via `tmux display-popup -E`; passes a temporary Unix socket path (`POLKIT_SOCK`) so the popup can read the full `AuthRequest` offline |
 | `main`/`prompt` | `tui` | `Tui::open` obtains the `/dev/tty` handle, `Terminal::draw` renders |
 | `main`/`prompt` | `ui` | `App` state machine + `render`/`render_full` |
 | `main`/`daemon`/`tui` | `logging` | `log_line` (stdout) / `error_line` (stderr) / `set_tui_active` |
@@ -150,8 +150,9 @@ self-contained for a single auth. Tasks:
 - Each password submission spawns an `authenticate_once` task that connects to
   the helper for PAM auth; the result returns via `Outcome` to the main loop
   (success → `break 0`, failure → `app.retry` back to editing).
-- If `POLKIT_CANCEL_FILE` is set, an extra 200ms polling task is spawned that
-  sets the cancel watch when the file appears.
+- If the cancel-file path (received from the `AuthRequest` via socket) is set,
+   an extra 200ms polling task is spawned that sets the cancel watch when
+   the file appears.
 
 ## 4. Module internals
 
@@ -204,7 +205,7 @@ self-contained for a single auth. Tasks:
 | `run` | outer reconnect loop + read loop; `current: Arc<Mutex<Option<String>>>` tracks the popup's cookie, `cancelled: Arc<Mutex<HashSet<String>>>` records cancelled cookies (guard against "cancel before popup request" race) |
 | `connect_with_retry` | reconnects every 2s, keeps waiting while the daemon is down |
 | `write_loop` | serializes `ClientMsg` into NDJSON lines written to the socket |
-| `run_popup` | `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_* <exe> --prompt`; exit code 0→Ok / 2→Cancel / other→Failed |
+| `run_popup` | binds a temporary `UnixListener` (`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`), then `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_SOCK=<path> <exe> --prompt`; popup connects, reads one `AuthRequest` NDJSON line, then the listener shuts down; exit code 0→Ok / 2→Cancel / other→Failed |
 | `cancel_file_path` | `$XDG_RUNTIME_DIR/polkit-tui-cancel-<FNV-1a hash>`, hash-derived when the cookie contains characters unsafe in filenames |
 
 `Request` handling does not block the read loop: it records the current cookie
@@ -219,10 +220,10 @@ popping up.
 
 | Item | Content |
 |---|---|
-| `run` | reads `POLKIT_*` env vars → `Tui::open` → `App::open_prompt` → four-way `select!` event loop → exit code |
+| `run` | reads `POLKIT_SOCK` → connects to temp socket, reads `AuthRequest` NDJSON → `Tui::open` → `App::open_prompt` → four-way `select!` event loop → exit code |
 | `Outcome` | `Success` / `Failure` / `Error(String)`, the background auth task's report |
 | `authenticate_once` | snapshots username/cookie/password, 10s helper connect, 30s per-message PAM loop, returns `Outcome` |
-| Cancel-file polling | `POLKIT_CANCEL_FILE` present → set the watch → main loop `break 2` |
+| Cancel-file polling | cancel-file path from `AuthRequest` present → set the watch → main loop `break 2` |
 | Idle timeout | editing state and `last_activity.elapsed() >= input_timeout` → `break 1` (neither 0 nor 2, mapped to Failed) |
 
 ### 4.6 `helper.rs` (polkit-agent-helper-1 client)
@@ -329,16 +330,18 @@ messages.
  │  daemon (socket server) │ ─────────────────────────────▶ │ controller (read loop)│
  │  id → pending table     │         (socket NDJSON)        │ current=cookie        │
  └────────────────────────┘                                └─────────┬─────────┘
-       ▲                                                           │ ③ spawn run_popup
-       │ ⑥ ClientMsg::Response{id,result}                           │    tmux display-popup -E
-       │    pending.remove(id) → oneshot                            │    -e POLKIT_COOKIE/...
-       └────────────────────────────────────────────────────────────┘
-                                                                     ▼
-                                                           ┌──────────────────┐
-                                                           │ --prompt process │
-                                                           │ ④ App + helper PAM│
-                                                           │ ⑤ exit code 0/2/other│
-                                                           └──────────────────┘
+        ▲                                                           │ ③ spawn run_popup
+        │ ⑥ ClientMsg::Response{id,result}                           │    bind temp UnixListener
+        │    pending.remove(id) → oneshot                            │    -e POLKIT_SOCK=<path>
+        └────────────────────────────────────────────────────────────┘
+                                                                      ▼
+                                                            ┌──────────────────┐
+                                                            │ --prompt process │
+                                                            │ ④ connect socket, │
+                                                            │    read AuthRequest│
+                                                            │ ⑤ App + helper PAM│
+                                                            │ ⑥ exit code 0/2/other│
+                                                            └──────────────────┘
 ```
 
 1. `begin_authentication` (Daemon backend) → `daemon.request(AuthRequest)`.
@@ -347,14 +350,18 @@ messages.
    `select!`s on the cancel token or the reply.
 3. The controller read loop receives it → records the current cookie → spawns
    `run_popup`.
-4. `run_popup` starts `--prompt` via `tmux display-popup -E`, passing
-   cookie/user/action/message/cancel_file through `-e POLKIT_*`; the command
-   body is `"<exe>" --prompt`.
-5. Inside `--prompt`: `App::open_prompt` draws the dialog → on submit spawns
-   `authenticate_once` → helper PAM → exit code.
+4. `run_popup` binds a temporary `UnixListener`, then starts `--prompt` via
+    `tmux display-popup -E`, passing only the socket path under
+    `POLKIT_SOCK`; the popup connects to the socket, reads one
+    `AuthRequest` NDJSON line (cookie/user/action/message/cancel_file),
+    and the listener discards its single connection and shuts down; the
+    command body is `"<exe>" --prompt`.
+5. Inside `--prompt`: read `POLKIT_SOCK` → connect and read the
+    `AuthRequest` → `App::open_prompt` draws the dialog → on submit spawns
+    `authenticate_once` → helper PAM → exit code.
 6. The controller maps the exit code to an `AuthResult` → `ClientMsg::Response{id,
-   result}` → socket → daemon read loop → `pending.remove(id)` → oneshot into
-   `request`.
+    result}` → socket → daemon read loop → `pending.remove(id)` → oneshot into
+    `request`.
 7. `begin_authentication` returns Ok/Cancelled/Failed per the `AuthResult`.
 
 ### 5.3 cancellation chain (polkitd-initiated cancel)
@@ -463,9 +470,14 @@ inline and popup differ in implementation but share the same semantics —
   connected to; if so, it refuses to start.
 - **Cancel file**: only a cancel signal (content fixed as `"cancel"`); its path
   contains an FNV-1a hash and does not leak the raw cookie.
-- **Popup args via environment variables**: `run_popup` passes request fields
-  through `-e`; the command body only concatenates the current exe path (quoted
-  against spaces), never injecting message content into a shell.
+- **Popup args via temporary Unix socket**: `run_popup` binds a single-use
+  `UnixListener` (`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`) per request,
+  passes only the path under `POLKIT_SOCK` via `-e`; the popup connects, reads
+  one `AuthRequest` NDJSON line, and disconnects — the listener accepts once
+  then closes. No request fields (cookie/user/action/message/cancel_file) appear
+  in `/proc/<pid>/environ`. The directory is 0700 and guarded by peer-cred; the
+  command body only concatenates the current exe path (quoted against spaces),
+  never injecting message content into a shell.
 - **Identity parsing**: manually decodes the `(String, HashMap)` tuple and
   skips unsupported identities such as `unix-group`; unknown PAM commands are
   tolerated as `Info` instead of failing hard.

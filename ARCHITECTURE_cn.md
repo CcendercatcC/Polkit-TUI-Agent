@@ -61,7 +61,7 @@
 | `agent` | `helper` | `HelperSession`：socket/二进制双路径连 root helper，行协议应答 |
 | `agent` | `daemon` | `daemon.request(AuthRequest) -> AuthResult`、`daemon.cancel(cookie)` |
 | `daemon` | `controller` | socket NDJSON：`ServerMsg`（Request/Cancel）/ `ClientMsg`（Response） |
-| `controller` | `prompt` | 经 `tmux display-popup -E` + `POLKIT_*` 环境变量拉起 `--prompt` |
+| `controller` | `prompt` | 经 `tmux display-popup -E` 拉起 `--prompt`，仅传临时 Unix socket 路径（`POLKIT_SOCK`），弹窗连 socket 读完整 `AuthRequest` |
 | `main`/`prompt` | `tui` | `Tui::open` 拿 `/dev/tty` 终端句柄，`Terminal::draw` 渲染 |
 | `main`/`prompt` | `ui` | `App` 状态机 + `render`/`render_full` |
 | `main`/`daemon`/`tui` | `logging` | `log_line`（stdout）/`error_line`（stderr）/`set_tui_active` |
@@ -130,8 +130,8 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
   `watch<bool>`（取消文件）、100ms tick。
 - 每提交一次密码 spawn 一个 `authenticate_once` 任务连 helper 做 PAM 认证，
   结果经 `Outcome` 送回主循环（成功 break 0、失败 `app.retry` 回编辑态）。
-- 若设置了 `POLKIT_CANCEL_FILE`，额外 spawn 一个 200ms 轮询任务，发现文件即
-  置位取消 watch。
+- 若从 socket 收到的 `AuthRequest` 中包含取消文件路径，额外 spawn 一个
+   200ms 轮询任务，发现文件即置位取消 watch。
 
 ## 4. 模块内部结构
 
@@ -184,7 +184,7 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 | `run` | 外层重连循环 + 读循环；`current: Arc<Mutex<Option<String>>>` 记录当前弹窗 cookie、`cancelled: Arc<Mutex<HashSet<String>>>` 记录已取消 cookie（防「取消先到、弹窗请求后到」竞态） |
 | `connect_with_retry` | 2s 间隔重连，daemon 未起时持续等待 |
 | `write_loop` | 把 `ClientMsg` 序列化为 NDJSON 行写 socket |
-| `run_popup` | `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_* <exe> --prompt`；退出码 0→Ok / 2→Cancel / 其他→Failed |
+| `run_popup` | 先绑定临时 `UnixListener`（`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`），再 `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_SOCK=<path> <exe> --prompt`；弹窗连上来读一行 `AuthRequest` NDJSON 后 listener 关闭；退出码 0→Ok / 2→Cancel / 其他→Failed |
 | `cancel_file_path` | `$XDG_RUNTIME_DIR/polkit-tui-cancel-<FNV-1a hash>`，cookie 含非文件名安全符号时用 hash 派生 |
 
 `Request` 处理不阻塞读循环：先记录 current cookie，spawn `run_popup` 任务，
@@ -196,10 +196,10 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 
 | 项 | 内容 |
 |---|---|
-| `run` | 读 `POLKIT_*` 环境变量 → `Tui::open` → `App::open_prompt` → 四路 `select!` 事件循环 → 退出码 |
+| `run` | 读 `POLKIT_SOCK` → 连临时 socket 读 `AuthRequest` NDJSON 一行 → `Tui::open` → `App::open_prompt` → 四路 `select!` 事件循环 → 退出码 |
 | `Outcome` | `Success` / `Failure` / `Error(String)`，后台认证任务的回报 |
 | `authenticate_once` | 快照用户名/cookie/密码，10s 连 helper，30s 单消息 PAM 循环，返回 `Outcome` |
-| 取消文件轮询 | `POLKIT_CANCEL_FILE` 存在即置位 watch → 主循环 break 2 |
+| 取消文件轮询 | 从 `AuthRequest` 获取的取消文件路径存在即置位 watch → 主循环 break 2 |
 | 空闲超时 | 编辑态且 `last_activity.elapsed() >= input_timeout` → break 1（非 0/2，映射 Failed） |
 
 ### 4.6 `helper.rs`（polkit-agent-helper-1 客户端）
@@ -302,26 +302,31 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
  │  daemon（socket 服务端） │ ─────────────────────────────▶ │ controller（读循环） │
  │  id → pending 表        │         （socket NDJSON）       │ current=cookie     │
  └────────────────────────┘                                └─────────┬─────────┘
-       ▲                                                           │ ③ spawn run_popup
-       │ ⑥ ClientMsg::Response{id,result}                           │    tmux display-popup -E
-       │    pending.remove(id) → oneshot                            │    -e POLKIT_COOKIE/...
-       └────────────────────────────────────────────────────────────┘
-                                                                     ▼
-                                                           ┌──────────────────┐
-                                                           │ --prompt 弹窗进程  │
-                                                           │ ④ App + helper PAM│
-                                                           │ ⑤ 退出码 0/2/其他   │
-                                                           └──────────────────┘
+        ▲                                                           │ ③ spawn run_popup
+        │ ⑥ ClientMsg::Response{id,result}                           │    bind 临时 UnixListener
+        │    pending.remove(id) → oneshot                            │    -e POLKIT_SOCK=<path>
+        └────────────────────────────────────────────────────────────┘
+                                                                      ▼
+                                                            ┌──────────────────┐
+                                                            │ --prompt 弹窗进程  │
+                                                            │ ④ 连 socket、     │
+                                                            │    读 AuthRequest │
+                                                            │ ⑤ App + helper PAM│
+                                                            │ ⑥ 退出码 0/2/其他   │
+                                                            └──────────────────┘
 ```
 
 1. `begin_authentication`（Daemon 后端）→ `daemon.request(AuthRequest)`。
 2. `request` 分配 `id`，把 oneshot 插入 `pending` 表，向当前 controller 发
    `ServerMsg::Request{id, req}`，`select!` 等取消令牌或应答。
 3. controller 读循环收到 → 记录 current cookie → spawn `run_popup`。
-4. `run_popup` 用 `tmux display-popup -E` 起 `--prompt`，经 `-e POLKIT_*`
-   传 cookie/user/action/message/cancel_file，命令体是 `"<exe>" --prompt`。
-5. `--prompt` 进程内：`App::open_prompt` 画框 → 提交后 spawn
-   `authenticate_once` → helper PAM → 退出码。
+4. `run_popup` 先起一个临时 `UnixListener`，再用 `tmux display-popup -E` 起
+    `--prompt`，仅把 socket 路径通过 `POLKIT_SOCK` 环境变量传入；弹窗连上
+    socket 读一行 `AuthRequest` NDJSON（cookie/user/action/message/
+    cancel_file），listener accept 一次即关闭；命令体是 `"<exe>" --prompt`。
+5. `--prompt` 进程内：读 `POLKIT_SOCK` → 连 socket 收 `AuthRequest` →
+    `App::open_prompt` 画框 → 提交后 spawn `authenticate_once` → helper PAM →
+    退出码。
 6. controller 把退出码映射 `AuthResult` → `ClientMsg::Response{id, result}` →
    socket → daemon 读循环 → `pending.remove(id)` → oneshot 送进 `request`。
 7. `begin_authentication` 按 `AuthResult` 返回 Ok/Cancelled/Failed。
@@ -421,8 +426,12 @@ inline 与弹窗的实现路径不同但语义一致——**键盘输入、提�
 - **防双 daemon**：`Daemon::start` 对残留 socket 先探测能否连接，能连即拒启。
 - **取消文件**：仅作取消信号（内容固定 `"cancel"`），路径含 FNV-1a hash，
   不泄露 cookie 明文。
-- **弹窗传参用环境变量**：`run_popup` 经 `-e` 传请求字段，命令体只拼
-  当前 exe 路径（加引号防空格），避免把消息内容插进 shell。
+- **弹窗传参用临时 Unix socket**：`run_popup` 为每次弹窗请求绑定一个一次性
+  `UnixListener`（`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`），仅把路径
+  经 `-e POLKIT_SOCK` 传入；弹窗连上读一行 `AuthRequest` NDJSON 后断开，
+  listener accept 一次即关闭。cookie/user/action/message/cancel_file 等请求
+  字段均不出现在 `/proc/<pid>/environ` 中。目录 0700 且有 peer-cred 校验；
+  命令体只拼当前 exe 路径（加引号防空格），避免把消息内容插进 shell。
 - **身份解析**：手动解 `(String, HashMap)` 元组，跳过 `unix-group` 等不支持
   的 identity；未知 PAM 命令按 `Info` 容错不误伤。
 - **诊断脱敏**：日志里 cookie 默认以 FNV-1a 哈希（16 位 hex）表示

@@ -173,7 +173,7 @@ pkexec echo ok
 - 弹窗出现后不操作，30s 后自动关闭、pkexec 报认证失败（时长可经
   `POLKIT_TUI_TIMEOUT` 调整）
 - 弹窗出现后 Ctrl-C 终止发起提权的 pkexec，弹窗应立即自动关闭；daemon 与
-  controller 的 stderr 会打印 `begin_authentication/cancel_authentication/
+  controller 的 stdout 会打印 `begin_authentication/cancel_authentication/
   daemon cancel/controller cancel` 日志便于核对取消链路。
 
 ## 许可

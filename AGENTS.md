@@ -27,7 +27,9 @@ ARCHITECTURE.md。本文件是改代码时的事实手册：架构、模块职�
 - `Agent::daemon` 注册 system bus（接收 `BeginAuthentication`）；`Daemon::start`
   监听本地回环 socket；controller 任务自连该 socket。
 - controller 收到请求后用 `tmux display-popup -E -T "polkit 认证" -w 70% -h 50%`
-  起一个弹窗进程（`--prompt`，经 `-e POLKIT_*` 环境变量传参）。
+  起一个弹窗进程（`--prompt`）。调用前先绑定临时 `UnixListener`，仅把 socket
+  路径经 `-e POLKIT_SOCK=<path>` 传入弹窗；弹窗连上后读一行 NDJSON
+  `AuthRequest`（含 cookie/user/action/message/cancel_file），读完断开。
 - `--prompt` 弹窗进程自包含：ratatui 画对话框 + helper 认证，错密码框内重试，
   退出码 0 成功 / 2 取消。
 
@@ -78,8 +80,9 @@ Request/Response 与 `display-popup` 逻辑。
 | `src/helper.rs` | `polkit-agent-helper-1` 会话客户端：socket/setuid 双路径 + 行协议 |
 | `src/ui.rs` | ratatui 状态（`App`）与对话框渲染，密码掩码输入 |
 
-tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → 弹窗进程 → 结果
-经 socket 回报。密码只存在于弹窗进程与 helper 的私有通道，socket 上只有结果。
+tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → controller 起临时
+`socket` 传参给弹窗进程 → 弹窗进程认证 → 结果经 daemon socket 回报。密码只存在于
+弹窗进程与 helper 的私有通道，socket 上只有结果。
 
 ## 依赖与 Cargo
 
@@ -107,7 +110,9 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → 弹窗进
 - socket 与取消文件都放 `$XDG_RUNTIME_DIR`（`main.rs::default_socket_path` / `controller.rs::cancel_file_path`），缺失时报错退出、不回退 /tmp（1777 共享目录无法安全承载，见函数注释）；daemon/controller/`--tmux` 均需 systemd 用户会话或手动设置该变量
 - `--uid-session` 是「强制第二级」不是开关：进程无直属 session（tmux 窗格 / systemd 用户服务 / 桌面终端）时默认逻辑本就落到 uid 图形会话，带不带结果相同；仅当进程**有**直属 session（如 daemon 跑在 SSH 直属终端）时才强制注册到桌面图形会话
 - 注册 session 必须与 polkit 判定一致，只信 `XDG_SESSION_ID` 会报 `Passed session and the session the caller is in differs`；注册日志打印 `session=<id>` 可核对
-- `--prompt` 为内部模式：controller 以 `display-popup -E` 拉起，读 `POLKIT_COOKIE/USER/ACTION/MESSAGE`（另有 `POLKIT_CANCEL_FILE` 指向取消文件），勿手动运行
+- `--prompt` 为内部模式：controller 以 `display-popup -E` 拉起，通过
+  `POLKIT_SOCK` 环境变量传入临时 socket 路径，连上后读一行 NDJSON 获取
+  cookie/user/action/message 与取消文件路径，勿手动运行
 
 ## 日志与调试选项
 - 日志里 cookie 默认以 FNV-1a 哈希（16 位 hex）表示（`main.rs::log_cookie`）：
@@ -123,7 +128,9 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → 弹窗进
 - zbus 必须保持 `default-features=false, features=["tokio"]`，不可换回 `async-io`
 - agent.rs 的 D-Bus 接口方法用 `&self` + 内部 `Mutex`，勿改 `&mut self`（zbus 串行化会致 `CancelAuthentication` 排队饿死）
 - 密码输入用 `Vec<char>`（`String` 下标 insert 多字节会 panic）；界面列宽按 CJK 计（`"密码: "` 是 6 列）
-- `--prompt` 退出码即协议：0 成功 / 2 取消，controller 据此映射 `AuthResult`；勿在 `--prompt` 外套吞退出码的 shell
+- `--prompt` 退出码即协议：0 成功 / 2 取消，controller 据此映射 `AuthResult`；
+  启动参数也通过 `POLKIT_SOCK` 临时 socket 走 NDJSON 线协议获取，而非环境变量
+  注入；勿在 `--prompt` 外套吞退出码的 shell
 - 密码只走 agent↔root helper 私有通道；D-Bus 与 socket NDJSON（protocol.rs）上只有结果
 - `zbus_polkit::Identity` 不可作 D-Bus 入参：只实现 `Serialize` 无 `Deserialize`，用元组 `(String, HashMap<String, OwnedValue>)` 手动解析（agent.rs:125）
 - `Subject::subject_details` 的值是 `OwnedValue`，无 `From<String>`，需 `OwnedValue::from(Str::from(...))`（main.rs:436）

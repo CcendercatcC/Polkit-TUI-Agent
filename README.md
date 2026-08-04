@@ -202,7 +202,7 @@ Additional verification points:
 - Press Ctrl-C to kill the escalating pkexec after the popup appears: the popup
   should close immediately; the daemon and controller print
   `begin_authentication/cancel_authentication/daemon cancel/controller cancel`
-  logs to stderr for tracing the cancellation chain.
+  logs to stdout for tracing the cancellation chain.
 
 ## License
 

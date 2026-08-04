@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,8 +33,16 @@ jobs:
           tar czf polkit-tui-agent-x86_64-unknown-linux-musl-${GITHUB_REF_NAME}.tgz \
             -C target/x86_64-unknown-linux-musl/release polkit-tui-agent
 
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --latest --strip header
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: git-cliff/CHANGELOG.md
           files: |
             polkit-tui-agent-*.tgz

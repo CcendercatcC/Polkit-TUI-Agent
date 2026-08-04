@@ -1,0 +1,9 @@
+[git]
+conventional_commits = false
+commit_parsers = [
+  { message = "^[Ff]ix", group = "Bug Fixes" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^style", group = "Style" },
+  { message = "^ci", group = "CI" },
+  { message = ".*", group = "Other" },
+]

@@ -147,7 +147,8 @@ fn uid_to_username(uid: u32) -> Option<String> {
 /// 从候选 identities 里选一个用户名。
 ///
 /// 偏好顺序：当前用户 → root → 第一个候选。桌面 agent 常这么选：优先让用户
-/// 认证自己，其次管理员；`unix-group` 之类不支持的 identity 会被跳过。
+/// 认证自己，其次管理员；仅接受 `unix-user` 候选，`unix-group` 一律不匹配——
+/// 若候选全是 unix-group，返回 `None`（调用方按 `Failed` 处理）。
 fn pick_username(identities: &[Identity]) -> Option<String> {
   let current = uzers::get_current_uid();
   for id in identities {

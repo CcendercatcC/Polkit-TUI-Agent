@@ -1,11 +1,16 @@
 //! # 弹窗单请求认证（`--prompt`）
 //!
 //! 由 controller 在 tmux `display-popup` 里启动，是**自包含**的单次认证：
-//! 从环境变量读请求信息 → 画对话框收密码 → 连 helper 完成 PAM → 按结果退出。
+//! 经 `POLKIT_SOCK` 环境变量拿到临时 socket 路径，连上后读一行 `AuthRequest`
+//! NDJSON 获得 cookie/user/action/message → 画对话框收密码 → 连 helper 完成
+//! PAM → 按结果退出。
+//!
+//! 连接保持：controller 取消认证时经同一连接写 `ServerMsg::Cancel` NDJSON 行，
+//! 读到且 cookie 匹配即以退出码 2 退出。
 //!
 //! 退出码约定（controller 据此映射）：
 //! - `0` = 认证成功（helper 已代调 AuthenticationAgentResponse2/3）
-//! - `2` = 用户取消（含 polkitd 经取消文件发来的取消）
+//! - `2` = 用户取消（含 controller 经 socket 发来的取消）
 //! - 其他 = 失败（含等待输入超时，见 `POLKIT_TUI_TIMEOUT`）
 //!
 //! 认证在独立任务里跑，主事件循环保持响应：验证期间仍能重绘「正在验证…」、
@@ -17,16 +22,36 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use futures::StreamExt;
 use ratatui::Frame;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
 use crate::helper::{HelperSession, PamMessage};
+use crate::protocol::{AuthRequest, ServerMsg};
 use crate::ui::{Action, App, PromptState};
 
 pub async fn run() -> Result<i32, String> {
-  let cookie = env::var("POLKIT_COOKIE").map_err(|_| "POLKIT_COOKIE not set")?;
-  let user = env::var("POLKIT_USER").unwrap_or_default();
-  let action = env::var("POLKIT_ACTION").unwrap_or_default();
-  let message = env::var("POLKIT_MESSAGE").unwrap_or_default();
+  // 临时 socket 路径：controller 经 `display-popup -E` 启动弹窗时注入。
+  // 缺失即拒绝——手动调用不带 `POLKIT_SOCK` 会被拒。
+  let sock = env::var("POLKIT_SOCK").map_err(|_| "POLKIT_SOCK not set".to_string())?;
+  // 连上 controller 的临时 socket，5s 超时兜底防挂死。
+  let stream = tokio::time::timeout(
+    Duration::from_secs(5),
+    tokio::net::UnixStream::connect(&sock),
+  )
+  .await
+  .map_err(|_| "connect POLKIT_SOCK timeout".to_string())?
+  .map_err(|e| format!("connect POLKIT_SOCK: {e}"))?;
+
+  // 读一行 NDJSON 取请求信息；连接保持，后续行用于收取消信号。
+  let mut reader = BufReader::new(stream);
+  let mut line = String::new();
+  reader
+    .read_line(&mut line)
+    .await
+    .map_err(|e| format!("read AuthRequest: {e}"))?;
+  let req: AuthRequest =
+    serde_json::from_str(line.trim()).map_err(|e| format!("parse AuthRequest: {e}"))?;
+
   // 等待输入的时长：`POLKIT_TUI_TIMEOUT` 可覆盖，默认 30s。超时视为认证失败。
   let input_timeout = env::var("POLKIT_TUI_TIMEOUT")
     .ok()
@@ -46,23 +71,34 @@ pub async fn run() -> Result<i32, String> {
   tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
   let mut app = App::new();
-  app.open_prompt(cookie, action, message, user);
+  app.open_prompt(req.cookie.clone(), req.action, req.message, req.user);
 
   // 认证结果通道：提交后 spawn 独立任务跑 helper，主循环保持响应——
   // 验证期间仍能重绘「正在验证…」、用 Esc/Ctrl-C 取消，不再被一次慢认证冻住。
   let (auth_tx, mut auth_rx) = mpsc::channel::<Outcome>(1);
 
-  // 取消文件：polkitd 取消认证时由 controller 写入该文件，此处轮询到即退出
-  // （exit 2）。让弹窗进程自身具备取消能力，不再单点依赖 `display-popup -C`。
+  // 取消信号：controller 取消认证时经同一 socket 写 `ServerMsg::Cancel` 行。
+  // 独立任务持续读后续行，命中且 cookie 匹配才置位（主循环据此退出码 2）；
+  // 读到 EOF（`Ok(None)`）或 IO 错误则静默结束——弹窗不因此退出，只是不再
+  // 收取消信号。
   let (cancel_tx, mut cancel_rx) = watch::channel(false);
-  if let Ok(cancel_path) = env::var("POLKIT_CANCEL_FILE") {
+  {
+    let cookie = req.cookie.clone();
     tokio::spawn(async move {
       loop {
-        if std::path::Path::new(&cancel_path).exists() {
-          let _ = cancel_tx.send(true);
-          break;
+        let mut cancel_line = String::new();
+        match reader.read_line(&mut cancel_line).await {
+          Ok(0) => break,
+          Ok(_) => {
+            if let Ok(ServerMsg::Cancel { cookie: c }) = serde_json::from_str(cancel_line.trim())
+              && c == cookie
+            {
+              let _ = cancel_tx.send(true);
+              break;
+            }
+          }
+          _ => break,
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
       }
     });
   }

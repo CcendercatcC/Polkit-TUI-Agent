@@ -288,7 +288,7 @@ async fn tmux_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     return Err("polkit-tui-agent: --tmux must run inside a tmux session".into());
   }
   let opts = parse_args_from(args).map_err(|e| format!("{e}\nTry --help"))?;
-  // 尽早校验 XDG_RUNTIME_DIR（socket/取消文件的宿主目录），缺失时先报错，
+  // 尽早校验 XDG_RUNTIME_DIR（socket 与一次性弹窗 socket 的宿主目录），缺失时先报错，
   // 不无谓连接 system bus。
   let socket = default_socket_path()?;
 
@@ -324,7 +324,7 @@ async fn tmux_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// 后台 daemon 模式：注册认证代理 + 启动 socket 服务端，然后常驻。
 async fn daemon_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
   let opts = parse_args_from(args).map_err(|e| format!("{e}\nTry --help"))?;
-  // 尽早校验 XDG_RUNTIME_DIR（socket/取消文件的宿主目录），缺失时先报错，
+  // 尽早校验 XDG_RUNTIME_DIR（socket 与一次性弹窗 socket 的宿主目录），缺失时先报错，
   // 不无谓连接 system bus。
   let socket = default_socket_path()?;
 

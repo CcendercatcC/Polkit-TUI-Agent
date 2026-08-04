@@ -93,8 +93,10 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → 弹窗进
 
 ## 构建与验证
 - 构建：`cargo build --release`（edition 2024，需 rustc ≥ 1.85）
-- 仓库无任何测试、无 CI/lint 配置；`cargo test` 无有效用例
-- **运行验证交给用户**：inline 需真实 tty、tmux 需 tmux 会话、真实认证依赖系统 polkit 与 root helper，agent 无法在会话内自测。改完只做编译级验证（`cargo build` / `cargo clippy` 若有），功能验证由用户手动执行
+- CI 走 GitHub Actions（`.github/workflows/ci.yml`）：push 到 main 与 PR 时跑
+  `cargo fmt --check` + `cargo clippy --all-targets` + `cargo build --release`；
+  `release.yml` 负责发布。仓库无测试用例，`cargo test` 无有效用例
+- **运行验证交给用户**：inline 需真实 tty、tmux 需 tmux 会话、真实认证依赖系统 polkit 与 root helper，agent 无法在会话内自测。改完先跑 `cargo fmt` 与 `cargo clippy`（与 CI 一致），功能验证由用户手动执行
 
 ## 运行前置条件
 - inline/`--prompt` 必须有可控终端（`tui.rs::has_controlling_tty()`，检查 `/dev/tty` 可打开）；TUI 输出走 `/dev/tty`，stdout/stderr 可任意重定向不影响界面
@@ -102,6 +104,7 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → 弹窗进
 - 同一 session scope 只能注册一个 agent：niri 的 gnome agent 在跑时注册必失败（`An authentication agent already exists`），测试前先 `systemctl --user stop 'app-niri-polkit\x2dgnome\x2dauthentication\x2dagent\x2d1-2352.scope'`
 - 真实认证依赖系统 polkit 与 root helper（`/run/polkit/agent-helper.socket`，socket 激活优先 / setuid 回退）
 - daemon 模式需 logind session：session 解析链 = 进程直属 session（`GetSessionByPID`）→ uid 图形会话（`GetUser(uid).Display`，即 polkit 的 `sd_uid_get_display`）→ `XDG_SESSION_ID` 兜底，全取不到注册失败
+- socket 与取消文件都放 `$XDG_RUNTIME_DIR`（`main.rs::default_socket_path` / `controller.rs::cancel_file_path`），缺失时报错退出、不回退 /tmp（1777 共享目录无法安全承载，见函数注释）；daemon/controller/`--tmux` 均需 systemd 用户会话或手动设置该变量
 - `--uid-session` 是「强制第二级」不是开关：进程无直属 session（tmux 窗格 / systemd 用户服务 / 桌面终端）时默认逻辑本就落到 uid 图形会话，带不带结果相同；仅当进程**有**直属 session（如 daemon 跑在 SSH 直属终端）时才强制注册到桌面图形会话
 - 注册 session 必须与 polkit 判定一致，只信 `XDG_SESSION_ID` 会报 `Passed session and the session the caller is in differs`；注册日志打印 `session=<id>` 可核对
 - `--prompt` 为内部模式：controller 以 `display-popup -E` 拉起，读 `POLKIT_COOKIE/USER/ACTION/MESSAGE`（另有 `POLKIT_CANCEL_FILE` 指向取消文件），勿手动运行

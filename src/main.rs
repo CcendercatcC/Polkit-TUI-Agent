@@ -244,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
   if args.iter().any(|a| a == "--controller") {
     // tmux 控制器：桥接 daemon 与 display-popup。
-    controller::run(&default_socket_path()).await?;
+    controller::run(&default_socket_path()?).await?;
     return Ok(());
   }
   if args.iter().any(|a| a == "--daemon") {
@@ -261,11 +261,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   inline_main(&args).await
 }
 
-/// daemon 与 controller 的 socket 路径。
-fn default_socket_path() -> String {
+/// daemon 与 controller 的 socket 路径：`$XDG_RUNTIME_DIR/polkit-tui-agent.sock`。
+///
+/// 只接受 `XDG_RUNTIME_DIR`（systemd 用户会话的标准 0700 位置），缺失时返回
+/// 错误而非回退 /tmp：/tmp 是 1777 的共享目录，无法安全承载 socket——其他
+/// 用户可删除该 socket 文件（controller 连不上，功能 DoS）、可抢先 bind 同一
+/// 可预测路径（`Daemon::start` 的 stale 探测 connect 成功 → 误判「另一 daemon
+/// 已存在」拒绝启动）、可删文件后自 bind 冒充 daemon 窃听认证请求。daemon
+/// 模式本就要求 logind session，取不到 XDG_RUNTIME_DIR 即报错退出更合理。
+fn default_socket_path() -> Result<String, &'static str> {
   std::env::var("XDG_RUNTIME_DIR")
     .map(|d| format!("{d}/polkit-tui-agent.sock"))
-    .unwrap_or_else(|_| format!("/tmp/polkit-tui-agent-{}.sock", uzers::get_current_uid()))
+    .map_err(|_| {
+      "XDG_RUNTIME_DIR is not set; cannot place the socket securely (run inside a systemd user session or set XDG_RUNTIME_DIR)"
+    })
 }
 
 /// tmux 一体模式：一个进程同时做 daemon 与 controller 的事。
@@ -279,6 +288,9 @@ async fn tmux_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     return Err("polkit-tui-agent: --tmux must run inside a tmux session".into());
   }
   let opts = parse_args_from(args).map_err(|e| format!("{e}\nTry --help"))?;
+  // 尽早校验 XDG_RUNTIME_DIR（socket/取消文件的宿主目录），缺失时先报错，
+  // 不无谓连接 system bus。
+  let socket = default_socket_path()?;
 
   let conn = Connection::system().await?;
   let subject = build_subject(&conn, &opts)
@@ -286,7 +298,6 @@ async fn tmux_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| e.to_string())?;
   register(&conn, &subject, &opts).await?;
 
-  let socket = default_socket_path();
   let daemon = daemon::Daemon::start(PathBuf::from(&socket))
     .await
     .map_err(|e| e.to_string())?;
@@ -313,6 +324,9 @@ async fn tmux_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// 后台 daemon 模式：注册认证代理 + 启动 socket 服务端，然后常驻。
 async fn daemon_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
   let opts = parse_args_from(args).map_err(|e| format!("{e}\nTry --help"))?;
+  // 尽早校验 XDG_RUNTIME_DIR（socket/取消文件的宿主目录），缺失时先报错，
+  // 不无谓连接 system bus。
+  let socket = default_socket_path()?;
 
   let conn = Connection::system().await?;
   let subject = build_subject(&conn, &opts)
@@ -320,7 +334,6 @@ async fn daemon_main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     .map_err(|e| e.to_string())?;
   register(&conn, &subject, &opts).await?;
 
-  let socket = default_socket_path();
   let daemon = daemon::Daemon::start(PathBuf::from(&socket))
     .await
     .map_err(|e| e.to_string())?;

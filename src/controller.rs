@@ -215,9 +215,13 @@ async fn run_popup(req: &AuthRequest, cancel_file: &str) -> AuthResult {
 /// 取消文件路径：`$XDG_RUNTIME_DIR/polkit-tui-cancel-<cookie-hash>`。
 ///
 /// controller 写它通知弹窗进程取消，弹窗进程轮询到文件即自行退出。
+///
+/// `XDG_RUNTIME_DIR` 缺失时不回退 /tmp：/tmp 是 1777 的共享目录，无法安全
+/// 放文件。所有入口（`--controller`/`--tmux`/`--daemon`）在到达 controller
+/// 之前都经 `default_socket_path()` 校验过 `XDG_RUNTIME_DIR`，缺失已提前退出，
+/// 这里 expect 不会触发。
 fn cancel_file_path(cookie: &str) -> String {
-  let dir = env::var("XDG_RUNTIME_DIR")
-    .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+  let dir = env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR required (validated at startup)");
   // cookie 可能含非文件名安全的符号，用 FNV-1a 派生短 hash。
   format!("{dir}/polkit-tui-cancel-{}", crate::fnv1a_hex(cookie))
 }

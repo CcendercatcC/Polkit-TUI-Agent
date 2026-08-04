@@ -30,7 +30,8 @@ ssh / tmux 等无图形界面场景设计。
 - 等待输入密码超时（默认 30s，`POLKIT_TUI_TIMEOUT` 环境变量可覆盖）：空闲超时语义——输入、提交、验证失败反馈都算活动并刷新计时，只有持续无操作才超时
 - daemon 侧 120s 认证超时兜底：controller 迟迟不回报结果时自动失败，避免认证永久挂起
 - daemon socket 校验对端 uid（`SO_PEERCRED`），只接受同用户 controller 连接
-- 取消认证双通道关弹窗：取消文件让弹窗进程自行退出 + `display-popup -C` 兜底
+- 取消认证双通道关弹窗：经弹窗 socket 发取消信号让弹窗进程自行退出 +
+  `display-popup -C` 兜底
 
 ## 编译与运行
 

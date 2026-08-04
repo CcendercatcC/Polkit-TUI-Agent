@@ -127,11 +127,11 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 由 controller 在 `display-popup` 内启动的短命进程，自包含一次认证。任务：
 
 - 主事件循环（`select!` 四路）：键盘、`mpsc<Outcome>`（后台认证任务回报）、
-  `watch<bool>`（取消文件）、100ms tick。
+  `watch<bool>`（来自 socket 的取消信号）、100ms tick。
 - 每提交一次密码 spawn 一个 `authenticate_once` 任务连 helper 做 PAM 认证，
   结果经 `Outcome` 送回主循环（成功 break 0、失败 `app.retry` 回编辑态）。
-- 若从 socket 收到的 `AuthRequest` 中包含取消文件路径，额外 spawn 一个
-   200ms 轮询任务，发现文件即置位取消 watch。
+- 后台任务持续读弹窗 socket 上的 `ServerMsg::Cancel` NDJSON 行，命中本请求
+  cookie 即置位取消 watch，主循环据此以退出码 2 退出。
 
 ## 4. 模块内部结构
 
@@ -161,7 +161,7 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 | `begin_authentication` | 选用户名 → 注册取消令牌 → `select!`（排队中取消 / 获取 slot）→ 按后端分发；结束清理令牌表并释放名额 |
 | `cancel_authentication` | 置位 watch + 按后端发 `UiEvent::Cancel` 或 `daemon.cancel` |
 | `authenticate_inline` | 认证主循环：发 Prompt → `select!`（取消/答复/超时/键盘活动刷新）→ 连 helper → PAM 行协议循环 → SUCCESS/Dismiss 或失败重试 |
-| `pick_username` | 候选 identity 偏好：当前用户 → root → 第一个候选；`unix-group` 跳过 |
+| `pick_username` | 候选 identity 偏好：当前用户 → root → 第一个候选；仅接受 `unix-user`，全是 `unix-group` 时返回 None → Failed |
 | `identity_uid` | 手动解析 `(String, HashMap<String, OwnedValue>)`，取 `unix-user` 的 uid |
 
 ### 4.3 `daemon.rs`（socket 服务端）
@@ -181,25 +181,28 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 
 | 项 | 内容 |
 |---|---|
-| `run` | 外层重连循环 + 读循环；`current: Arc<Mutex<Option<String>>>` 记录当前弹窗 cookie、`cancelled: Arc<Mutex<HashSet<String>>>` 记录已取消 cookie（防「取消先到、弹窗请求后到」竞态） |
+| `run` | 外层重连循环 + 读循环；`current: Arc<Mutex<Option<String>>>` 记录当前弹窗 cookie、`cancelled: Arc<Mutex<HashSet<String>>>` 记录已取消 cookie（防「取消先到、弹窗请求后到」竞态）；另有共享 `cancel_sig` 取消通道（弹窗连接写任务） |
 | `connect_with_retry` | 2s 间隔重连，daemon 未起时持续等待 |
 | `write_loop` | 把 `ClientMsg` 序列化为 NDJSON 行写 socket |
-| `run_popup` | 先绑定临时 `UnixListener`（`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`），再 `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_SOCK=<path> <exe> --prompt`；弹窗连上来读一行 `AuthRequest` NDJSON 后 listener 关闭；退出码 0→Ok / 2→Cancel / 其他→Failed |
-| `cancel_file_path` | `$XDG_RUNTIME_DIR/polkit-tui-cancel-<FNV-1a hash>`，cookie 含非文件名安全符号时用 hash 派生 |
+| `run_popup` | 先绑定临时 `UnixListener`（`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`），再 `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_SOCK=<path> <exe> --prompt`；弹窗连上来读一行 `AuthRequest` NDJSON，**连接保持**供取消信号，listener accept 一次即关闭；退出码 0→Ok / 2→Cancel / 其他→Failed |
+| `popup_socket_path` | `$XDG_RUNTIME_DIR/polkit-tui-popup-<FNV-1a hash>`，cookie 含非文件名安全符号时用 hash 派生；一次性 socket 同时承载请求与取消信号 |
 
 `Request` 处理不阻塞读循环：先记录 current cookie，spawn `run_popup` 任务，
-弹窗结束清理取消文件与 current 标记后回报。`Cancel` 到达即记入 `cancelled`
-集合；若 cookie 匹配 current 则写取消文件 + `tmux display-popup -C` 兜底关闭；
-此后若同 cookie 的 `Request` 才到，直接回报取消不弹窗。
+弹窗结束清理 current 标记后回报。`Cancel` 到达即记入 `cancelled` 集合；若
+cookie 匹配 current 则经共享 `cancel_sig` 通道通知弹窗写任务（在同一条
+popup socket 上写 `ServerMsg::Cancel` NDJSON 行）+ `tmux display-popup -C`
+兜底关闭；此后若同 cookie 的 `Request` 才到，直接回报取消不弹窗。弹窗连接
+建立后由 `run_popup` 注册 `cancel_sig`、退出时摘除；accept 后若该 cookie 已在
+`cancelled` 集合，立即发取消信号，覆盖「取消先到、连接后到」竞态。
 
 ### 4.5 `prompt.rs`（弹窗单请求认证）
 
 | 项 | 内容 |
 |---|---|
-| `run` | 读 `POLKIT_SOCK` → 连临时 socket 读 `AuthRequest` NDJSON 一行 → `Tui::open` → `App::open_prompt` → 四路 `select!` 事件循环 → 退出码 |
+| `run` | 读 `POLKIT_SOCK`（缺失报错退出）→ 连临时 socket 读 `AuthRequest` NDJSON 一行 → `Tui::open` → `App::open_prompt` → 四路 `select!` 事件循环 → 退出码 |
 | `Outcome` | `Success` / `Failure` / `Error(String)`，后台认证任务的回报 |
 | `authenticate_once` | 快照用户名/cookie/密码，10s 连 helper，30s 单消息 PAM 循环，返回 `Outcome` |
-| 取消文件轮询 | 从 `AuthRequest` 获取的取消文件路径存在即置位 watch → 主循环 break 2 |
+| socket 取消读任务 | 后台任务持续读弹窗 socket 上的 `ServerMsg::Cancel`，匹配请求 cookie 即置位 watch → 主循环 break 2；EOF/IO 错误静默结束（弹窗不退出，只是不再收取消信号） |
 | 空闲超时 | 编辑态且 `last_activity.elapsed() >= input_timeout` → break 1（非 0/2，映射 Failed） |
 
 ### 4.6 `helper.rs`（polkit-agent-helper-1 客户端）
@@ -218,7 +221,9 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 `AuthRequest`（cookie/user/action/message）、`AuthResult`（Ok/Cancel/Failed）、
 `ServerMsg`（`Request{id,req}` / `Cancel{cookie}`）、`ClientMsg`
 （`Response{id,result}`）。都用 `#[serde(tag="type", rename_all="lowercase")]`
-做标签化。密码永不进入这些消息。
+做标签化。controller↔弹窗进程复用同一套类型与行协议：弹窗从临时 socket 读
+一行 `AuthRequest`，controller 在同一条连接上写 `ServerMsg::Cancel` 行通知
+取消。密码永不进入这些消息。
 
 ### 4.8 `ui.rs`（状态 + 渲染）
 
@@ -322,8 +327,8 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 3. controller 读循环收到 → 记录 current cookie → spawn `run_popup`。
 4. `run_popup` 先起一个临时 `UnixListener`，再用 `tmux display-popup -E` 起
     `--prompt`，仅把 socket 路径通过 `POLKIT_SOCK` 环境变量传入；弹窗连上
-    socket 读一行 `AuthRequest` NDJSON（cookie/user/action/message/
-    cancel_file），listener accept 一次即关闭；命令体是 `"<exe>" --prompt`。
+    socket 读一行 `AuthRequest` NDJSON（cookie/user/action/message），listener
+    accept 一次即关闭，弹窗**保持连接**供取消信号；命令体是 `"<exe>" --prompt`。
 5. `--prompt` 进程内：读 `POLKIT_SOCK` → 连 socket 收 `AuthRequest` →
     `App::open_prompt` 画框 → 提交后 spawn `authenticate_once` → helper PAM →
     退出码。
@@ -345,9 +350,9 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
                                                                     │ ServerMsg::Cancel
                                                                     ▼
                                                              controller 匹配 current
-                                                                     │ 写取消文件 + display-popup -C
-                                                                     ▼
-                                                             --prompt 轮询到文件 → exit 2
+                                                                    │ 取消信号 → popup socket + display-popup -C
+                                                                    ▼
+                                                             --prompt 读到 ServerMsg::Cancel → exit 2
 ```
 
 1. polkitd 调 `cancel_authentication(cookie)`。
@@ -356,14 +361,15 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 3. inline：`authenticate_inline` 的 `select!` 命中 `cancel_rx.changed()` → 发
    `UiEvent::Dismiss` → 返回 `Cancelled`。
 4. daemon 链路：`daemon.cancel` 发 `ServerMsg::Cancel`；controller 匹配
-   current cookie → 写取消文件 + `tmux display-popup -C`；`--prompt` 轮询到
-   文件退出 2；controller 回报的迟到 `Response` 无害（daemon 已通过本地
-   取消令牌返回，`pending` 表项已被 `PendingGuard` 清理）。
+   current cookie → 经共享取消通道通知弹窗写任务（在 popup socket 上写
+   `ServerMsg::Cancel` 行）+ `tmux display-popup -C`；`--prompt` 读到该行退出
+   2；controller 回报的迟到 `Response` 无害（daemon 已通过本地取消令牌返回，
+   `pending` 表项已被 `PendingGuard` 清理）。
 
 ### 5.4 关键对象生命周期
 
 - **cookie**：从 polkitd 传入起贯穿 agent→daemon→controller→`--prompt`→
-  helper，是取消文件、`UiEvent`、`ServerMsg::Cancel` 的对齐键。
+  helper，是 `UiEvent`、`ServerMsg::Cancel`、弹窗 socket/取消通道的对齐键。
 - **请求 id**：`next_id` 递增，仅存在于 daemon 的 `pending` 表与 socket 消息，
   用于关联 controller 的回报。
 - **取消令牌（watch）**：`begin_authentication` 插入、结束清理；`cancel` 只
@@ -371,6 +377,8 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 - **`PendingGuard`**：Drop 清理保证 `request` 被 `select!` 放弃或超时时
   `pending` 表不残留。
 - **socket 文件**：`Daemon::start` 时若残留且可连接则拒启，否则删除重绑。
+- **弹窗 socket 文件**：`run_popup` 绑定一次性 `UnixListener`，弹窗退出后
+  （所有返回路径）删除该文件。
 
 ## 6. 并发与同步模型
 
@@ -387,7 +395,7 @@ socket**。内嵌 controller 任务与远程 controller 行为完全一致，只
 | `controller.rs run` | `write_loop` | `ClientMsg` → socket |
 | `controller.rs run` | `run_popup` 任务 | 每请求一个，弹窗期间读循环不被阻塞 |
 | `main.rs tmux_main` | `controller::run` | 自连内嵌控制器 |
-| `prompt.rs run` | 取消文件轮询 | 200ms 查文件 |
+| `prompt.rs run` | 弹窗 socket 取消读任务 | 持续读 popup socket 上的 `ServerMsg::Cancel` |
 | `prompt.rs run` | `authenticate_once` | 每次提交一个，主循环保持响应 |
 
 `tokio::select!` 点：`main.rs run_tui`（keys/ui_events/tick）、
@@ -424,16 +432,17 @@ inline 与弹窗的实现路径不同但语义一致——**键盘输入、提�
   等于当前 uid；socket 位于 `$XDG_RUNTIME_DIR`（0700）内，peer_cred 是纵深
   防御。
 - **防双 daemon**：`Daemon::start` 对残留 socket 先探测能否连接，能连即拒启。
-- **取消文件**：仅作取消信号（内容固定 `"cancel"`），路径含 FNV-1a hash，
-  不泄露 cookie 明文。
 - **弹窗传参用临时 Unix socket**：`run_popup` 为每次弹窗请求绑定一个一次性
   `UnixListener`（`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`），仅把路径
-  经 `-e POLKIT_SOCK` 传入；弹窗连上读一行 `AuthRequest` NDJSON 后断开，
-  listener accept 一次即关闭。cookie/user/action/message/cancel_file 等请求
+  经 `-e POLKIT_SOCK` 传入；弹窗连上读一行 `AuthRequest` NDJSON，连接保持
+  供取消信号，listener accept 一次即关闭。cookie/user/action/message 等请求
   字段均不出现在 `/proc/<pid>/environ` 中。目录 0700 且有 peer-cred 校验；
   命令体只拼当前 exe 路径（加引号防空格），避免把消息内容插进 shell。
-- **身份解析**：手动解 `(String, HashMap)` 元组，跳过 `unix-group` 等不支持
-  的 identity；未知 PAM 命令按 `Info` 容错不误伤。
+- **取消走弹窗 socket**：取消是弹窗 socket 上的一行 `ServerMsg::Cancel` NDJSON
+  （不再用取消文件）；`--prompt` 强制要求 `POLKIT_SOCK`，无它即拒绝，挡手动
+  伪造调用。
+- **身份解析**：手动解 `(String, HashMap)` 元组，仅接受 `unix-user`
+  （全是 `unix-group` 时认证返回失败）；未知 PAM 命令按 `Info` 容错不误伤。
 - **诊断脱敏**：日志里 cookie 默认以 FNV-1a 哈希（16 位 hex）表示
   （`log_cookie`），完整会话标识不外泄；排查时加 `--full-cookie-log` 打印全量。
 

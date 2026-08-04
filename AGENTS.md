@@ -29,9 +29,10 @@ ARCHITECTURE.md。本文件是改代码时的事实手册：架构、模块职�
 - controller 收到请求后用 `tmux display-popup -E -T "polkit 认证" -w 70% -h 50%`
   起一个弹窗进程（`--prompt`）。调用前先绑定临时 `UnixListener`，仅把 socket
   路径经 `-e POLKIT_SOCK=<path>` 传入弹窗；弹窗连上后读一行 NDJSON
-  `AuthRequest`（含 cookie/user/action/message/cancel_file），读完断开。
+  `AuthRequest`（含 cookie/user/action/message），**连接保持**——取消时 controller
+  经同一连接写一行 `ServerMsg::Cancel` NDJSON，弹窗读到即退出。
 - `--prompt` 弹窗进程自包含：ratatui 画对话框 + helper 认证，错密码框内重试，
-  退出码 0 成功 / 2 取消。
+  退出码 0 成功 / 2 取消 / 其他失败（含等待输入超时）。
 
 分离部署（`--daemon` + `--controller`）时多一个 socket 转发层，适合 daemon 做
 systemd 用户服务、controller 单独在 tmux 里跑；`--tmux` 一体模式把两者合并在
@@ -64,8 +65,8 @@ Request/Response 与 `display-popup` 逻辑。
    `pkexec` 会报 `Request dismissed`。
 4. **发起方（如 pkexec）被终止**时，polkitd 通过 `NameOwnerChanged` 检测到后
    调用 agent 的 `CancelAuthentication`：agent 置位本地取消令牌，并通知
-   controller 关弹窗。弹窗进程经取消文件（`$XDG_RUNTIME_DIR/polkit-tui-cancel-<hash>`）
-   自行退出（退出码 2），`display-popup -C` 作兜底。
+   controller 关弹窗。controller 经弹窗连接写一行 `ServerMsg::Cancel` NDJSON，
+   弹窗自行退出（退出码 2），`display-popup -C` 作兜底。
 
 ## 模块职责
 
@@ -74,9 +75,9 @@ Request/Response 与 `display-popup` 逻辑。
 | `src/main.rs` | 入口：四种模式分发、注册、inline TUI 事件循环 |
 | `src/agent.rs` | D-Bus 服务端接口 `AuthenticationAgent`；`Backend` 抽象 Inline/Daemon 两种收集密码方式；并发认证经信号量 FIFO 串行逐个验证 |
 | `src/daemon.rs` | socket 服务端：请求/响应队列、取消广播、Drop 清理守卫 |
-| `src/controller.rs` | tmux 桥：读请求 → `display-popup -E` 起弹窗 → 映射退出码回报 |
-| `src/prompt.rs` | 弹窗单请求认证（`--prompt`，自包含收密码 + helper 认证） |
-| `src/protocol.rs` | daemon↔controller 的 NDJSON 线协议 |
+| `src/controller.rs` | tmux 桥：读请求 → `display-popup -E` 起弹窗 → 经临时 socket 传递请求/取消信号 → 映射退出码回报 |
+| `src/prompt.rs` | 弹窗单请求认证（`--prompt`，连 controller 临时 socket 收请求/取消 + helper 认证） |
+| `src/protocol.rs` | daemon↔controller 与 controller↔弹窗共用的 NDJSON 线协议 |
 | `src/helper.rs` | `polkit-agent-helper-1` 会话客户端：socket/setuid 双路径 + 行协议 |
 | `src/ui.rs` | ratatui 状态（`App`）与对话框渲染，密码掩码输入 |
 
@@ -107,12 +108,12 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → controlle
 - 同一 session scope 只能注册一个 agent：niri 的 gnome agent 在跑时注册必失败（`An authentication agent already exists`），测试前先 `systemctl --user stop 'app-niri-polkit\x2dgnome\x2dauthentication\x2dagent\x2d1-2352.scope'`
 - 真实认证依赖系统 polkit 与 root helper（`/run/polkit/agent-helper.socket`，socket 激活优先 / setuid 回退）
 - daemon 模式需 logind session：session 解析链 = 进程直属 session（`GetSessionByPID`）→ uid 图形会话（`GetUser(uid).Display`，即 polkit 的 `sd_uid_get_display`）→ `XDG_SESSION_ID` 兜底，全取不到注册失败
-- socket 与取消文件都放 `$XDG_RUNTIME_DIR`（`main.rs::default_socket_path` / `controller.rs::cancel_file_path`），缺失时报错退出、不回退 /tmp（1777 共享目录无法安全承载，见函数注释）；daemon/controller/`--tmux` 均需 systemd 用户会话或手动设置该变量
+- socket 与一次性弹窗 socket 都放 `$XDG_RUNTIME_DIR`（`main.rs::default_socket_path` / `controller.rs::popup_socket_path`），缺失时报错退出、不回退 /tmp（1777 共享目录无法安全承载，见函数注释）；daemon/controller/`--tmux` 均需 systemd 用户会话或手动设置该变量
 - `--uid-session` 是「强制第二级」不是开关：进程无直属 session（tmux 窗格 / systemd 用户服务 / 桌面终端）时默认逻辑本就落到 uid 图形会话，带不带结果相同；仅当进程**有**直属 session（如 daemon 跑在 SSH 直属终端）时才强制注册到桌面图形会话
 - 注册 session 必须与 polkit 判定一致，只信 `XDG_SESSION_ID` 会报 `Passed session and the session the caller is in differs`；注册日志打印 `session=<id>` 可核对
 - `--prompt` 为内部模式：controller 以 `display-popup -E` 拉起，通过
   `POLKIT_SOCK` 环境变量传入临时 socket 路径，连上后读一行 NDJSON 获取
-  cookie/user/action/message 与取消文件路径，勿手动运行
+  cookie/user/action/message，连接保持、取消时读 `ServerMsg::Cancel` 行，勿手动运行
 
 ## 日志与调试选项
 - 日志里 cookie 默认以 FNV-1a 哈希（16 位 hex）表示（`main.rs::log_cookie`）：
@@ -121,14 +122,14 @@ tmux 数据流：`AuthRequest` 经 socket NDJSON 传给 controller → controlle
   全局开关由 `main()` 统一设置（`LOG_FULL_COOKIE`），各模块直接读
 - 哈希有全局缓存（`COOKIE_LOG_CACHE`）：同一 cookie 的 begin/queued/cancel
   多行日志只算一次；full 模式不走缓存
-- 取消文件路径复用同一 `fnv1a_hex`（controller.rs::cancel_file_path），
+- 弹窗 socket 路径复用同一 `fnv1a_hex`（controller.rs::popup_socket_path），
   勿另写一份 FNV
 
 ## 改代码时的红线
 - zbus 必须保持 `default-features=false, features=["tokio"]`，不可换回 `async-io`
 - agent.rs 的 D-Bus 接口方法用 `&self` + 内部 `Mutex`，勿改 `&mut self`（zbus 串行化会致 `CancelAuthentication` 排队饿死）
 - 密码输入用 `Vec<char>`（`String` 下标 insert 多字节会 panic）；界面列宽按 CJK 计（`"密码: "` 是 6 列）
-- `--prompt` 退出码即协议：0 成功 / 2 取消，controller 据此映射 `AuthResult`；
+- `--prompt` 退出码即协议：0 成功 / 2 取消 / 其他失败（等待输入超时为 1），controller 据此映射 `AuthResult`；
   启动参数也通过 `POLKIT_SOCK` 临时 socket 走 NDJSON 线协议获取，而非环境变量
   注入；勿在 `--prompt` 外套吞退出码的 shell
 - 密码只走 agent↔root helper 私有通道；D-Bus 与 socket NDJSON（protocol.rs）上只有结果

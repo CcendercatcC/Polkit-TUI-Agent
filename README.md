@@ -46,8 +46,8 @@ Pure Rust, zero GTK/glib dependencies.
   the request fails automatically instead of hanging forever
 - Daemon socket validates the peer uid (`SO_PEERCRED`), only accepts
   controllers owned by the same user
-- Two-channel popup cancellation: a cancel file makes the popup process exit
-  by itself, plus `display-popup -C` as a fallback
+- Two-channel popup cancellation: a cancel signal on the popup socket makes the
+  popup process exit by itself, plus `display-popup -C` as a fallback
 
 ## Build & Run
 

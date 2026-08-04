@@ -146,13 +146,14 @@ A short-lived process started by the controller inside `display-popup`,
 self-contained for a single auth. Tasks:
 
 - Main event loop (`select!` on four sources): keyboard, `mpsc<Outcome>`
-  (background auth task reports), `watch<bool>` (cancel file), 100ms tick.
+  (background auth task reports), `watch<bool>` (cancel signal from socket),
+  100ms tick.
 - Each password submission spawns an `authenticate_once` task that connects to
   the helper for PAM auth; the result returns via `Outcome` to the main loop
   (success → `break 0`, failure → `app.retry` back to editing).
-- If the cancel-file path (received from the `AuthRequest` via socket) is set,
-   an extra 200ms polling task is spawned that sets the cancel watch when
-   the file appears.
+- A background task keeps reading the popup socket for `ServerMsg::Cancel`
+  NDJSON lines; when one matching this request's cookie arrives, it sets the
+  cancel watch and the main loop exits with code 2.
 
 ## 4. Module internals
 
@@ -182,7 +183,7 @@ self-contained for a single auth. Tasks:
 | `begin_authentication` | pick username → register cancel token → `select!` (cancel while queued / acquire slot) → dispatch by backend; cleans up the token table and releases the slot on exit |
 | `cancel_authentication` | set the watch + dispatch `UiEvent::Cancel` (inline) or `daemon.cancel` (daemon) by backend |
 | `authenticate_inline` | auth main loop: send Prompt → `select!` (cancel/reply/timeout/keyboard activity refresh) → connect helper → PAM line-protocol loop → SUCCESS/Dismiss or retry on failure |
-| `pick_username` | identity preference: current user → root → first candidate; `unix-group` skipped |
+| `pick_username` | identity preference: current user → root → first candidate; only `unix-user` accepted — all-`unix-group` yields `None` → `Failed` |
 | `identity_uid` | manually parses `(String, HashMap<String, OwnedValue>)`, takes the `unix-user` uid |
 
 ### 4.3 `daemon.rs` (socket server)
@@ -205,16 +206,20 @@ self-contained for a single auth. Tasks:
 | `run` | outer reconnect loop + read loop; `current: Arc<Mutex<Option<String>>>` tracks the popup's cookie, `cancelled: Arc<Mutex<HashSet<String>>>` records cancelled cookies (guard against "cancel before popup request" race) |
 | `connect_with_retry` | reconnects every 2s, keeps waiting while the daemon is down |
 | `write_loop` | serializes `ClientMsg` into NDJSON lines written to the socket |
-| `run_popup` | binds a temporary `UnixListener` (`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`), then `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_SOCK=<path> <exe> --prompt`; popup connects, reads one `AuthRequest` NDJSON line, then the listener shuts down; exit code 0→Ok / 2→Cancel / other→Failed |
-| `cancel_file_path` | `$XDG_RUNTIME_DIR/polkit-tui-cancel-<FNV-1a hash>`, hash-derived when the cookie contains characters unsafe in filenames |
+| `run_popup` | binds a temporary `UnixListener` (`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`), then `tmux display-popup -E -T "polkit 认证" -w 70% -h 50% -e POLKIT_SOCK=<path> <exe> --prompt`; popup connects, reads one `AuthRequest` NDJSON line, connection is kept for cancel; listener accepts once then shuts down; exit code 0→Ok / 2→Cancel / other→Failed |
+| `popup_socket_path` | `$XDG_RUNTIME_DIR/polkit-tui-popup-<FNV-1a hash>`, hash-derived when the cookie contains characters unsafe in filenames; the single-use socket carries both the request and cancel signals |
 
 `Request` handling does not block the read loop: it records the current cookie
 first, spawns a `run_popup` task, and reports back after the popup finishes
-(cleaning up the cancel file and the current marker). When a `Cancel` arrives it
-is recorded in `cancelled`; if the cookie matches `current`, it writes the
-cancel file + `tmux display-popup -C` as a fallback close; if a `Request` with
-the same cookie arrives afterwards, it reports cancellation directly without
-popping up.
+(cleaning up the current marker). When a `Cancel` arrives it is recorded in
+`cancelled`; if the cookie matches `current`, it sends a cancel signal on the
+popup's shared channel (the popup's write task writes a `ServerMsg::Cancel`
+NDJSON line on the socket) plus `tmux display-popup -C` as a fallback close; if
+a `Request` with the same cookie arrives afterwards, it reports cancellation
+directly without popping up. The shared `cancel_sig` channel (cookie→sender) is
+set by `run_popup` once the popup connects and cleared when it exits, which
+also covers the "cancel arrives before the popup connects" race: `run_popup`
+checks `cancelled` after accepting and sends the cancel signal immediately.
 
 ### 4.5 `prompt.rs` (popup single-request auth)
 
@@ -223,7 +228,7 @@ popping up.
 | `run` | reads `POLKIT_SOCK` → connects to temp socket, reads `AuthRequest` NDJSON → `Tui::open` → `App::open_prompt` → four-way `select!` event loop → exit code |
 | `Outcome` | `Success` / `Failure` / `Error(String)`, the background auth task's report |
 | `authenticate_once` | snapshots username/cookie/password, 10s helper connect, 30s per-message PAM loop, returns `Outcome` |
-| Cancel-file polling | cancel-file path from `AuthRequest` present → set the watch → main loop `break 2` |
+| Cancel via socket | a background task keeps reading the popup socket for `ServerMsg::Cancel` matching the request cookie → sets the cancel watch → main loop `break 2`; on EOF/IO error it ends silently (the popup keeps running, just stops receiving cancel signals) |
 | Idle timeout | editing state and `last_activity.elapsed() >= input_timeout` → `break 1` (neither 0 nor 2, mapped to Failed) |
 
 ### 4.6 `helper.rs` (polkit-agent-helper-1 client)
@@ -242,8 +247,11 @@ popping up.
 `AuthRequest` (cookie/user/action/message), `AuthResult` (Ok/Cancel/Failed),
 `ServerMsg` (`Request{id,req}` / `Cancel{cookie}`), `ClientMsg`
 (`Response{id,result}`). All tagged with
-`#[serde(tag="type", rename_all="lowercase")]`. Passwords never enter these
-messages.
+`#[serde(tag="type", rename_all="lowercase")]`. The same types and line protocol
+are reused between the controller and the `--prompt` popup: the popup reads one
+`AuthRequest` NDJSON line off the temporary socket, and the controller writes a
+`ServerMsg::Cancel` line on that connection to cancel. Passwords never enter
+these messages.
 
 ### 4.8 `ui.rs` (state + rendering)
 
@@ -353,9 +361,9 @@ messages.
 4. `run_popup` binds a temporary `UnixListener`, then starts `--prompt` via
     `tmux display-popup -E`, passing only the socket path under
     `POLKIT_SOCK`; the popup connects to the socket, reads one
-    `AuthRequest` NDJSON line (cookie/user/action/message/cancel_file),
-    and the listener discards its single connection and shuts down; the
-    command body is `"<exe>" --prompt`.
+    `AuthRequest` NDJSON line (cookie/user/action/message), and the listener
+    discards its single connection and shuts down; the popup **keeps the
+    connection** for cancel signals; the command body is `"<exe>" --prompt`.
 5. Inside `--prompt`: read `POLKIT_SOCK` → connect and read the
     `AuthRequest` → `App::open_prompt` draws the dialog → on submit spawns
     `authenticate_once` → helper PAM → exit code.
@@ -378,9 +386,9 @@ messages.
                                                                    │ ServerMsg::Cancel
                                                                    ▼
                                                             controller matches current
-                                                                   │ write cancel file + display-popup -C
+                                                                   │ cancel signal → popup socket + display-popup -C
                                                                    ▼
-                                                            --prompt polls the file → exit 2
+                                                            --prompt reads ServerMsg::Cancel → exit 2
 ```
 
 1. polkitd calls `cancel_authentication(cookie)`.
@@ -389,16 +397,18 @@ messages.
 3. inline: `authenticate_inline`'s `select!` hits `cancel_rx.changed()` → sends
    `UiEvent::Dismiss` → returns `Cancelled`.
 4. daemon chain: `daemon.cancel` sends `ServerMsg::Cancel`; the controller
-   matches the current cookie → writes the cancel file + `tmux display-popup
-   -C`; `--prompt` polls the file and exits 2; a late `Response` from the
-   controller is harmless (the daemon already returned via the local cancel
-   token, and the `pending` entry was cleaned by `PendingGuard`).
+   matches the current cookie → sends a cancel signal on the popup's shared
+   channel (its write task writes `ServerMsg::Cancel` on the popup socket) +
+   `tmux display-popup -C`; `--prompt` reads that line and exits 2; a late
+   `Response` from the controller is harmless (the daemon already returned via
+   the local cancel token, and the `pending` entry was cleaned by
+   `PendingGuard`).
 
 ### 5.4 key object lifetimes
 
 - **cookie**: from polkitd it travels agent→daemon→controller→`--prompt`→helper,
-  and is the alignment key for the cancel file, `UiEvent`, and
-  `ServerMsg::Cancel`.
+  and is the alignment key for `UiEvent`, `ServerMsg::Cancel`, and the popup
+  socket/cancel channel.
 - **request id**: `next_id` increments; it exists only in the daemon's `pending`
   table and socket messages, tying the controller's reply to its request.
 - **cancel token (watch)**: inserted by `begin_authentication`, cleaned up on
@@ -407,6 +417,8 @@ messages.
   residue after a `request` is abandoned by `select!` or times out.
 - **socket file**: `Daemon::start` refuses to start if a stale socket is
   connectable, otherwise deletes and rebinds.
+- **popup socket file**: `run_popup` binds a single-use `UnixListener`, deletes
+  the file after the popup exits (on every return path).
 
 ## 6. Concurrency and synchronization model
 
@@ -424,7 +436,7 @@ shared state — no lock is ever held for long.
 | `controller.rs run` | `write_loop` | `ClientMsg` → socket |
 | `controller.rs run` | `run_popup` task | one per request; read loop stays unblocked while a popup is open |
 | `main.rs tmux_main` | `controller::run` | embedded self-connecting controller |
-| `prompt.rs run` | cancel-file polling | checks the file every 200ms |
+| `prompt.rs run` | popup socket cancel reader | keeps reading the popup socket for `ServerMsg::Cancel` |
 | `prompt.rs run` | `authenticate_once` | one per submission, main loop stays responsive |
 
 `tokio::select!` points: `main.rs run_tui` (keys/ui_events/tick),
@@ -468,18 +480,21 @@ inline and popup differ in implementation but share the same semantics —
   `$XDG_RUNTIME_DIR` (0700), and peer_cred is defense in depth.
 - **No dual daemon**: `Daemon::start` probes whether a stale socket can be
   connected to; if so, it refuses to start.
-- **Cancel file**: only a cancel signal (content fixed as `"cancel"`); its path
-  contains an FNV-1a hash and does not leak the raw cookie.
 - **Popup args via temporary Unix socket**: `run_popup` binds a single-use
   `UnixListener` (`$XDG_RUNTIME_DIR/polkit-tui-popup-<fnv1a_hex>`) per request,
   passes only the path under `POLKIT_SOCK` via `-e`; the popup connects, reads
-  one `AuthRequest` NDJSON line, and disconnects — the listener accepts once
-  then closes. No request fields (cookie/user/action/message/cancel_file) appear
-  in `/proc/<pid>/environ`. The directory is 0700 and guarded by peer-cred; the
-  command body only concatenates the current exe path (quoted against spaces),
-  never injecting message content into a shell.
+  one `AuthRequest` NDJSON line, and keeps the connection for cancel signals —
+  the listener accepts once then closes. No request fields
+  (cookie/user/action/message) appear in `/proc/<pid>/environ`. The directory is
+  0700 and guarded by peer-cred; the command body only concatenates the current
+  exe path (quoted against spaces), never injecting message content into a
+  shell.
+- **Cancel via popup socket**: cancel is a `ServerMsg::Cancel` NDJSON line on
+  the same popup socket (not a file); `--prompt` requires `POLKIT_SOCK` and
+  rejects manual invocations without it.
 - **Identity parsing**: manually decodes the `(String, HashMap)` tuple and
-  skips unsupported identities such as `unix-group`; unknown PAM commands are
+  accepts only `unix-user` identities (all-`unix-group` → `None` → `Failed`);
+  unknown PAM commands are
   tolerated as `Info` instead of failing hard.
 - **Diagnostics redaction**: cookies in logs default to an FNV-1a hash (16 hex
   digits) via `log_cookie`, so the full session identifier is not exposed; add
